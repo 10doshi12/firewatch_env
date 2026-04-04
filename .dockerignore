@@ -1,0 +1,15 @@
+tests/
+.env
+.env.*
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.git/
+.gitignore
+inference.py
+client.py
+README.md
+*.md
+uv.lock
+openenv_firewatch_env.egg-info/

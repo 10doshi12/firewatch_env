@@ -1,0 +1,8 @@
+.venv/
+openenv_firewatch_env.egg-info/
+.env
+.env.*
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
