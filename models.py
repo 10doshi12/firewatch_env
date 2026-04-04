@@ -1,97 +1,374 @@
 # models.py
-# Phase 1 stub — minimum typed models to pass openenv validate.
-# All fields have explicit type annotations. No Any. No untyped fields.
-# Phase 2 expands every model with full field specifications.
+# Phase 2 — All Pydantic models for FirewatchEnv.
+# Every field has explicit type annotations. No Any (except FirewatchAction.parameters).
+# Field names follow OpenTelemetry semantic conventions.
+#
+# Models defined here:
+#   1. ServiceMetrics — per-service telemetry snapshot (21 OTel fields)
+#   2. Alert — Prometheus Alertmanager-format alert
+#   3. SystemObservation — complete observable state (returned by reset/step/state)
+#   4. FirewatchAction — agent command with strict Literal action_type
+#   5. ActionResult — structured result of an action
+#   6. derive_status() — utility to compute status from metric thresholds
 
 from __future__ import annotations
 
+from typing import Any, Literal
+
 from pydantic import BaseModel, Field
 
+try:
+    from .config import (
+        STATUS_THRESHOLD_CRITICAL_ERROR,
+        STATUS_THRESHOLD_CRITICAL_LATENCY,
+        STATUS_THRESHOLD_DEGRADED_ERROR,
+        STATUS_THRESHOLD_DEGRADED_LATENCY,
+        STATUS_THRESHOLD_DOWN_ERROR,
+        STATUS_THRESHOLD_DOWN_MEMORY,
+    )
+except ImportError:
+    from config import (
+        STATUS_THRESHOLD_CRITICAL_ERROR,
+        STATUS_THRESHOLD_CRITICAL_LATENCY,
+        STATUS_THRESHOLD_DEGRADED_ERROR,
+        STATUS_THRESHOLD_DEGRADED_LATENCY,
+        STATUS_THRESHOLD_DOWN_ERROR,
+        STATUS_THRESHOLD_DOWN_MEMORY,
+    )
 
-# ---------------------------------------------------------------------------
-# Stub sub-models
-# Defined here so services and active_alerts are fully typed (no bare dict/list)
-# ---------------------------------------------------------------------------
 
-class ServiceSnapshot(BaseModel):
+# --------------------------------------------------------------------------
+# Type aliases for readability
+# --------------------------------------------------------------------------
+
+ServiceStatus = Literal["healthy", "degraded", "critical", "down"]
+
+AlertName = Literal[
+    "HighErrorRate",
+    "HighLatency",
+    "MemoryPressure",
+    "HighCPU",
+    "ServiceDown",
+    "RequestBacklog",
+]
+
+AlertSeverity = Literal["warning", "critical", "page"]
+
+ActionType = Literal[
+    # Investigation actions — reveal information, no state mutation
+    "fetch_logs",
+    "get_metrics_detail",
+    "trace_dependencies",
+    # Remediation actions — mutate system state
+    "restart_service",
+    "rollback_deploy",
+    "revert_config",
+    "scale_replicas",
+    "circuit_break",
+    # Meta actions — episode control
+    "declare_resolved",
+    "escalate",
+]
+
+
+# --------------------------------------------------------------------------
+# ServiceMetrics — per-service telemetry (replaces Phase 1 ServiceSnapshot)
+# --------------------------------------------------------------------------
+
+class ServiceMetrics(BaseModel):
     """
-    Minimal typed snapshot of one service's metrics.
-    Expanded to full ServiceMetrics in Phase 2 with all OTel fields.
+    Complete telemetry snapshot for one microservice.
+
+    All metric field names follow OpenTelemetry semantic conventions.
+    Underscore naming is the Pydantic convention; each field documents
+    the corresponding OTel dot-notation name.
+
+    Status is NOT auto-computed — the simulation sets it explicitly
+    via derive_status() after mutating metrics each tick.
     """
-    status: str = "healthy"
-    http_server_error_rate: float = 0.0
-    http_server_request_duration_p99: float = 0.1
-    process_memory_utilization: float = 0.0
-    process_cpu_utilization: float = 0.0
-    restart_count: int = 0
-    recent_logs: list[str] = Field(default_factory=list)
+
+    # --- Resource attributes (OTel resource) ---
+    service_name: str = Field(
+        ..., description="OTel: service.name. e.g. 'payment-service'"
+    )
+    service_version: str = Field(
+        default="v1.0.0", description="OTel: service.version"
+    )
+    service_instance_id: str = Field(
+        ..., description="OTel: service.instance.id. e.g. 'payment-7d9f8b-xkp2m'"
+    )
+
+    # --- Derived status ---
+    status: ServiceStatus = Field(
+        default="healthy",
+        description="Derived from metric thresholds. Set by simulation via derive_status().",
+    )
+
+    # --- HTTP server metrics (OTel stable) ---
+    http_server_request_duration_p99: float = Field(
+        default=0.1,
+        description="OTel: http.server.request.duration p99 bucket. Unit: seconds. Healthy: 0.05–0.5.",
+    )
+    http_server_error_rate: float = Field(
+        default=0.0,
+        description="Derived from OTel http.response.status_code 5xx ratio. Unit: ratio 0.0–1.0.",
+    )
+    http_server_active_requests: int = Field(
+        default=50,
+        description="OTel: http.server.active_requests. Unit: {request}. Normal: 1–200.",
+    )
+
+    # --- Process metrics (OTel) ---
+    process_cpu_utilization: float = Field(
+        default=0.15,
+        description="OTel: process.cpu.utilization. Unit: ratio 0.0–1.0 (NOT percentage).",
+    )
+    process_memory_usage_bytes: int = Field(
+        default=178257920,
+        description="OTel: process.memory.usage. Unit: bytes. ~170MB default.",
+    )
+    process_memory_limit_bytes: int = Field(
+        default=536870912,
+        description="Container config, not OTel-emitted. Unit: bytes. 512MB default.",
+    )
+    process_memory_utilization: float = Field(
+        default=0.33,
+        description="Derived: usage_bytes / limit_bytes. Can exceed 1.0 before OOMKill.",
+    )
+    process_open_file_descriptors: int = Field(
+        default=120,
+        description="OTel: process.open_file_descriptor.count. High = connection exhaustion.",
+    )
+
+    # --- Runtime / deployment metadata ---
+    runtime_uptime_seconds: int = Field(
+        default=86400,
+        description="OTel: process.runtime.uptime. Resets to 0 on restart. 24h default.",
+    )
+    restart_count: int = Field(
+        default=0,
+        description="OTel-adjacent: k8s.container.restart_count. Increments on OOMKill.",
+    )
+    last_deployment_sha: str = Field(
+        default="a3f9d21",
+        description="Short git SHA of last deployment.",
+    )
+    last_deployment_age_seconds: int = Field(
+        default=172800,
+        description="Seconds since last deployment. Low = recent deploy = suspect for bad_deploy.",
+    )
+    last_config_revision: int = Field(
+        default=1,
+        description="Monotonically increasing config revision number.",
+    )
+    last_config_age_seconds: int = Field(
+        default=259200,
+        description="Seconds since last config change. Low = suspect for config_drift.",
+    )
+
+    # --- Logs (populated only after fetch_logs action) ---
+    recent_logs: list[str] = Field(
+        default_factory=list,
+        description="Empty by default. Populated by fetch_logs action. Last 20 log lines.",
+    )
 
 
-class AlertSnapshot(BaseModel):
+# --------------------------------------------------------------------------
+# Alert — Prometheus Alertmanager format
+# --------------------------------------------------------------------------
+
+class Alert(BaseModel):
     """
-    Minimal typed alert entry following Prometheus Alertmanager conventions.
-    Expanded to full Alert model in Phase 2.
+    Alert following Prometheus Alertmanager payload conventions.
+    Generated by the simulation when metric thresholds are breached.
+    Resolves automatically when metric returns below threshold.
     """
-    alert_id: str
-    alertname: str
-    service_name: str
-    severity: str
-    description: str
-    fired_at_tick: int = 0
+
+    alert_id: str = Field(
+        ..., description="Short UUID. e.g. 'a1b2c3d4'"
+    )
+    alertname: AlertName = Field(
+        ..., description="Human-readable alert name."
+    )
+    service_name: str = Field(
+        ..., description="Which service triggered the alert."
+    )
+    severity: AlertSeverity = Field(
+        ..., description="Severity level."
+    )
+    description: str = Field(
+        ...,
+        description=(
+            "Human-readable description. Format: "
+            "'<metric> is <value> (threshold: <threshold>) on <service> for <n> ticks'"
+        ),
+    )
+    fired_at_tick: int = Field(
+        ..., description="Simulation tick when the threshold was crossed."
+    )
+    metric_name: str = Field(
+        ..., description="The OTel metric name that breached threshold."
+    )
+    metric_value: float = Field(
+        ..., description="Current value at time of firing."
+    )
+    threshold_value: float = Field(
+        ..., description="The configured threshold that was crossed."
+    )
 
 
-# ---------------------------------------------------------------------------
-# Core exported models
-# ---------------------------------------------------------------------------
-
-class FirewatchAction(BaseModel):
-    """
-    Agent action. action_type must be one of the 10 valid action strings.
-    Literal constraint added in Phase 2 once all action types are confirmed.
-    target_service is required for all actions except declare_resolved and escalate.
-    """
-    action_type: str
-    target_service: str | None = None
-    parameters: dict[str, str] = Field(default_factory=dict)
-
+# --------------------------------------------------------------------------
+# SystemObservation — complete observable state
+# --------------------------------------------------------------------------
 
 class SystemObservation(BaseModel):
     """
-    Complete observable state of the simulated production environment.
-    Returned by reset(), step(), and state().
-    services is keyed by service_name.
+    Complete observable state returned by reset(), step(), and state().
+    The agent receives this after every action.
     """
-    services: dict[str, ServiceSnapshot] = Field(default_factory=dict)
-    active_alerts: list[AlertSnapshot] = Field(default_factory=list)
-    dependency_graph: dict[str, list[str]] = Field(default_factory=dict)
-    slo_budget_remaining_pct: float = 100.0
-    bad_customer_minutes: float = 0.0
-    sim_time_elapsed_seconds: int = 0
-    sim_tick: int = 0
-    action_history: list[str] = Field(default_factory=list)
-    incident_declared: bool = False
-    mttm_achieved_tick: int | None = None
 
+    services: dict[str, ServiceMetrics] = Field(
+        default_factory=dict,
+        description="Per-service metrics keyed by service_name. Subset of full topology.",
+    )
+    active_alerts: list[Alert] = Field(
+        default_factory=list,
+        description="Currently firing alerts. Auto-resolve when metric recovers.",
+    )
+    dependency_graph: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="Static topology for this episode. Does not change between ticks.",
+    )
+    slo_budget_remaining_pct: float = Field(
+        default=100.0,
+        description="Error budget %. Starts at 100.0, depletes per tick. 0.0 = episode over.",
+    )
+    bad_customer_minutes: float = Field(
+        default=0.0,
+        description="Cumulative user impact. Google SRE MTTM measurement.",
+    )
+    sim_time_elapsed_seconds: int = Field(
+        default=0,
+        description="Simulated seconds since episode start. 30s per tick.",
+    )
+    sim_tick: int = Field(
+        default=0,
+        description="Current tick number. Starts at 0 after reset().",
+    )
+    action_history: list[dict[str, str]] = Field(
+        default_factory=list,
+        description=(
+            "Last 10 actions. Each entry: "
+            "{action_type, target_service, feedback_string}."
+        ),
+    )
+    incident_declared: bool = Field(
+        default=False,
+        description="True if agent called declare_resolved. Terminal condition.",
+    )
+    mttm_achieved_tick: int | None = Field(
+        default=None,
+        description="Tick when user impact first reached zero. None until achieved.",
+    )
+
+
+# --------------------------------------------------------------------------
+# FirewatchAction — agent command
+# --------------------------------------------------------------------------
+
+class FirewatchAction(BaseModel):
+    """
+    Agent action. action_type is strictly validated against 10 allowed values.
+    Unknown action_types are rejected with Pydantic ValidationError.
+    The environment catches ValidationError and returns a graceful error response.
+    """
+
+    action_type: ActionType = Field(
+        ..., description="SRE command to execute."
+    )
+    target_service: str | None = Field(
+        default=None,
+        description="service_name to target. Required for all except declare_resolved/escalate.",
+    )
+    parameters: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Optional action params. e.g. {'memory_limit_mb': 1024} for scale_replicas.",
+    )
+
+
+# --------------------------------------------------------------------------
+# ActionResult — structured action feedback
+# --------------------------------------------------------------------------
 
 class ActionResult(BaseModel):
     """
     Structured result of an agent action.
     Included in the info dict returned by every step() call.
     """
-    valid: bool
-    feedback: str
-    action_type: str = ""
-    target_service: str | None = None
+
+    valid: bool = Field(
+        ..., description="Whether the action was valid and executed."
+    )
+    feedback: str = Field(
+        ..., description="Human-readable feedback about what happened."
+    )
+    action_type: str = Field(
+        default="", description="Echo of the action_type that was executed."
+    )
+    target_service: str | None = Field(
+        default=None, description="Echo of the target_service."
+    )
 
 
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Status derivation utility
+# --------------------------------------------------------------------------
+
+def derive_status(metrics: ServiceMetrics) -> ServiceStatus:
+    """
+    Compute service status from current metric values.
+
+    Applied in priority order: down → critical → degraded → healthy.
+    Thresholds sourced from config.py (PRD §7.2).
+
+    The simulation calls this after mutating metrics each tick to update
+    the status field. It is NOT auto-computed on model access because the
+    simulation needs explicit control over when status updates happen.
+    """
+    if (
+        metrics.http_server_error_rate >= STATUS_THRESHOLD_DOWN_ERROR
+        or metrics.process_memory_utilization >= STATUS_THRESHOLD_DOWN_MEMORY
+    ):
+        return "down"
+
+    if (
+        metrics.http_server_error_rate >= STATUS_THRESHOLD_CRITICAL_ERROR
+        or metrics.http_server_request_duration_p99 >= STATUS_THRESHOLD_CRITICAL_LATENCY
+    ):
+        return "critical"
+
+    if (
+        metrics.http_server_error_rate >= STATUS_THRESHOLD_DEGRADED_ERROR
+        or metrics.http_server_request_duration_p99 >= STATUS_THRESHOLD_DEGRADED_LATENCY
+    ):
+        return "degraded"
+
+    return "healthy"
+
+
+# --------------------------------------------------------------------------
 # Public API
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
 
 __all__ = [
-    "FirewatchAction",
+    "ServiceMetrics",
+    "Alert",
     "SystemObservation",
+    "FirewatchAction",
     "ActionResult",
-    "ServiceSnapshot",
-    "AlertSnapshot",
+    "ActionType",
+    "AlertName",
+    "AlertSeverity",
+    "ServiceStatus",
+    "derive_status",
 ]

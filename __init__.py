@@ -7,10 +7,21 @@
 """Firewatch Env Environment."""
 
 from .client import FirewatchEnv
-from .models import FirewatchAction, SystemObservation
+from .models import (
+    ActionResult,
+    Alert,
+    FirewatchAction,
+    ServiceMetrics,
+    SystemObservation,
+    derive_status,
+)
 
 __all__ = [
+    "ActionResult",
+    "Alert",
     "FirewatchAction",
-    "SystemObservation",
     "FirewatchEnv",
+    "ServiceMetrics",
+    "SystemObservation",
+    "derive_status",
 ]

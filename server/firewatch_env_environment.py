@@ -1,5 +1,6 @@
 # server/firewatch_env_environment.py
-# Phase 1 stub — three endpoint methods with hardcoded placeholder responses.
+# Phase 2 — Updated imports to use ServiceMetrics (replaces ServiceSnapshot).
+# Three endpoint methods with hardcoded placeholder responses.
 # Zero simulation logic. Full implementation added in Phase 7.
 #
 # Base class and import paths confirmed from official OpenEnv builder docs:
@@ -19,14 +20,14 @@ from openenv.core.env_server.types import State
 
 # Dual-import pattern — required for both in-repo and Docker execution
 try:
-    from ..models import FirewatchAction, SystemObservation, ServiceSnapshot
+    from ..models import FirewatchAction, SystemObservation, ServiceMetrics
 except ImportError:
-    from models import FirewatchAction, SystemObservation, ServiceSnapshot
+    from models import FirewatchAction, SystemObservation, ServiceMetrics
 
 
 class FirewatchEnvironment(Environment):
     """
-    SRE Incident Response RL Environment — Phase 1 stub.
+    SRE Incident Response RL Environment — Phase 2 stub.
 
     Simulates a microservice production system where an AI agent acts as
     an on-call SRE engineer, diagnosing and remediating incidents before
@@ -59,11 +60,13 @@ class FirewatchEnvironment(Environment):
         try:
             self._state = State(episode_id=str(uuid4()), step_count=0)
 
-            # Phase 1 stub — hardcoded placeholder observation.
+            # Phase 2 stub — hardcoded placeholder observation.
             # Phase 7 replaces this with generate_episode(difficulty, seed).
             return SystemObservation(
                 services={
-                    "auth-service": ServiceSnapshot(
+                    "auth-service": ServiceMetrics(
+                        service_name="auth-service",
+                        service_instance_id="auth-7d9f8b-xkp2m",
                         status="healthy",
                         http_server_error_rate=0.0,
                         http_server_request_duration_p99=0.12,
@@ -94,7 +97,7 @@ class FirewatchEnvironment(Environment):
                 bad_customer_minutes=0.0,
                 sim_time_elapsed_seconds=0,
                 sim_tick=0,
-                action_history=[f"reset error: {exc}"],
+                action_history=[{"action_type": "reset", "target_service": "", "feedback_string": f"reset error: {exc}"}],
                 incident_declared=False,
                 mttm_achieved_tick=None,
             )
@@ -123,7 +126,7 @@ class FirewatchEnvironment(Environment):
                 step_count=self._state.step_count + 1,
             )
 
-            # Phase 1 stub — return placeholder observation.
+            # Phase 2 stub — return placeholder observation.
             # Phase 7 replaces with full tick() + action handling + reward.
             return SystemObservation(
                 services={},
@@ -134,8 +137,11 @@ class FirewatchEnvironment(Environment):
                 sim_time_elapsed_seconds=30,
                 sim_tick=self._state.step_count,
                 action_history=[
-                    f"step {self._state.step_count}: "
-                    f"{action.action_type} on {action.target_service}"
+                    {
+                        "action_type": action.action_type,
+                        "target_service": action.target_service or "",
+                        "feedback_string": f"stub: {action.action_type} on {action.target_service}",
+                    }
                 ],
                 incident_declared=action.action_type == "declare_resolved",
                 mttm_achieved_tick=None,
@@ -150,7 +156,7 @@ class FirewatchEnvironment(Environment):
                 bad_customer_minutes=0.0,
                 sim_time_elapsed_seconds=0,
                 sim_tick=self._state.step_count,
-                action_history=[f"step error: {exc}"],
+                action_history=[{"action_type": "step", "target_service": "", "feedback_string": f"step error: {exc}"}],
                 incident_declared=False,
                 mttm_achieved_tick=None,
             )
