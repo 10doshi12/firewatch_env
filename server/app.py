@@ -38,7 +38,7 @@ except Exception as e:  # pragma: no cover
 try:
     from ..models import FirewatchAction, SystemObservation
     from .firewatch_env_environment import FirewatchEnvironment
-except ModuleNotFoundError:
+except (ImportError, SystemError):
     from models import FirewatchAction, SystemObservation
     from server.firewatch_env_environment import FirewatchEnvironment
 

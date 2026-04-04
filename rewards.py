@@ -170,6 +170,8 @@ class EpisodeResult:
     # Internal tracking
     _affected_services: set[str] = field(default_factory=set, repr=False)
     _recovered_services: set[str] = field(default_factory=set, repr=False)
+    # Services ACTUALLY observed as degraded (status != healthy at some point)
+    _observed_degraded: set[str] = field(default_factory=set, repr=False)
 
     def update(
         self,
@@ -183,7 +185,9 @@ class EpisodeResult:
         for name, metrics in obs.services.items():
             if metrics.status != "healthy":
                 self._affected_services.add(name)
-            elif name in self._affected_services:
+                self._observed_degraded.add(name)
+            elif name in self._observed_degraded:
+                # Only count as recovered if it was actually observed degraded
                 self._recovered_services.add(name)
 
         self.services_affected = len(self._affected_services)

@@ -6,7 +6,7 @@
 
 """Firewatch Env Environment Client."""
 
-from typing import Dict
+from typing import Any, Dict
 
 from openenv.core import EnvClient
 from openenv.core.client_types import StepResult
@@ -26,22 +26,13 @@ class FirewatchEnv(
     Each client instance has its own dedicated environment session on the server.
 
     Example:
-        >>> # Connect to a running server
         >>> with FirewatchEnv(base_url="http://localhost:8000") as client:
-        ...     result = client.reset()
-        ...     print(result.observation.echoed_message)
+        ...     result = client.reset(difficulty="easy", seed=42)
+        ...     print(result.observation.sim_tick)
         ...
-        ...     result = client.step(FirewatchAction(message="Hello!"))
-        ...     print(result.observation.echoed_message)
-
-    Example with Docker:
-        >>> # Automatically start container and connect
-        >>> client = FirewatchEnv.from_docker_image("firewatch_env-env:latest")
-        >>> try:
-        ...     result = client.reset()
-        ...     result = client.step(FirewatchAction(message="Test"))
-        ... finally:
-        ...     client.close()
+        ...     action = FirewatchAction(action_type="fetch_logs", target_service="auth-service")
+        ...     result = client.step(action)
+        ...     print(result.observation.slo_budget_remaining_pct)
     """
 
     def _step_payload(self, action: FirewatchAction) -> Dict:
@@ -54,28 +45,27 @@ class FirewatchEnv(
         Returns:
             Dictionary representation suitable for JSON encoding
         """
-        return {
-            "message": action.message,
+        payload: Dict[str, Any] = {
+            "action_type": action.action_type,
         }
+        if action.target_service is not None:
+            payload["target_service"] = action.target_service
+        if action.parameters:
+            payload["parameters"] = action.parameters
+        return payload
 
-    def _parse_result(self, payload: Dict) -> StepResult[FirewatchObservation]:
+    def _parse_result(self, payload: Dict) -> StepResult[SystemObservation]:
         """
-        Parse server response into StepResult[FirewatchObservation].
+        Parse server response into StepResult[SystemObservation].
 
         Args:
             payload: JSON response data from server
 
         Returns:
-            StepResult with FirewatchObservation
+            StepResult with SystemObservation
         """
         obs_data = payload.get("observation", {})
-        observation = FirewatchObservation(
-            echoed_message=obs_data.get("echoed_message", ""),
-            message_length=obs_data.get("message_length", 0),
-            done=payload.get("done", False),
-            reward=payload.get("reward"),
-            metadata=obs_data.get("metadata", {}),
-        )
+        observation = SystemObservation(**obs_data)
 
         return StepResult(
             observation=observation,

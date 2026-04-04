@@ -17,6 +17,18 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+# OpenEnv base types — provide done, reward, metadata fields
+# required by the HTTP server's serialize_observation() and deserialize_action()
+try:
+    from openenv.core.env_server.types import (
+        Observation as _ObservationBase,
+        Action as _ActionBase,
+    )
+except ImportError:
+    # Fallback for environments where openenv-core is not installed
+    _ObservationBase = BaseModel  # type: ignore[assignment,misc]
+    _ActionBase = BaseModel  # type: ignore[assignment,misc]
+
 try:
     from .config import (
         STATUS_THRESHOLD_CRITICAL_ERROR,
@@ -221,10 +233,15 @@ class Alert(BaseModel):
 # SystemObservation — complete observable state
 # --------------------------------------------------------------------------
 
-class SystemObservation(BaseModel):
+class SystemObservation(_ObservationBase):
     """
     Complete observable state returned by reset(), step(), and state().
     The agent receives this after every action.
+
+    Inherits from openenv Observation which provides:
+      - done: bool (episode terminated)
+      - reward: float | None (step reward)
+      - metadata: dict (additional info dict)
     """
 
     services: dict[str, ServiceMetrics] = Field(
@@ -276,11 +293,14 @@ class SystemObservation(BaseModel):
 # FirewatchAction — agent command
 # --------------------------------------------------------------------------
 
-class FirewatchAction(BaseModel):
+class FirewatchAction(_ActionBase):
     """
     Agent action. action_type is strictly validated against 10 allowed values.
     Unknown action_types are rejected with Pydantic ValidationError.
     The environment catches ValidationError and returns a graceful error response.
+
+    Inherits from openenv Action which provides:
+      - metadata: dict (additional action metadata)
     """
 
     action_type: ActionType = Field(
