@@ -21,6 +21,7 @@ dependencies = [
     "pydantic>=2.0.0",
     # LLM inference (OpenAI-compatible client for HuggingFace router)
     "openai>=1.0.0",
+    "python-dotenv>=1.2.2",
 ]
 
 [project.optional-dependencies]

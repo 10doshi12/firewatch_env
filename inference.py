@@ -19,6 +19,12 @@ import urllib.request
 from typing import Optional
 from openai import OpenAI
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # load .env from CWD or any parent directory
+except ImportError:
+    pass  # python-dotenv optional — falls back to system env vars
+
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME   = os.getenv("MODEL_NAME",   "Qwen/Qwen2.5-7B-Instruct")
 API_KEY      = os.getenv("HF_TOKEN")
@@ -115,14 +121,14 @@ def _pick_remediation(service_name: str, fetched_logs: dict) -> dict:
     log_text = " ".join(logs).lower()
     if "oomkilled" in log_text or "exit code 137" in log_text or "memory limit" in log_text:
         return {"action_type": "restart_service", "target_service": service_name}
-    if "nullpointerexception" in log_text or "deploy" in log_text or "version" in log_text:
-        return {"action_type": "rollback_deploy", "target_service": service_name}
     if "hikaripool" in log_text or "connection pool" in log_text or "timed out after" in log_text:
         return {"action_type": "revert_config", "target_service": service_name}
     if "connection refused" in log_text or "circuit breaker" in log_text:
         return {"action_type": "circuit_break", "target_service": service_name}
     if "memory leak" in log_text or "high latency" in log_text:
         return {"action_type": "scale_replicas", "target_service": service_name}
+    if "nullpointerexception" in log_text or "deploy" in log_text or "version" in log_text:
+        return {"action_type": "rollback_deploy", "target_service": service_name}
     return {"action_type": "restart_service", "target_service": service_name}
 
 
@@ -145,6 +151,9 @@ def rule_based_action(obs: dict, step: int, state: dict) -> dict:
 
     if step == 1:
         rc = find_root_cause(services, dep_graph)
+        if rc is None:
+            # Fault not yet propagated — probe the highest-rate service anyway
+            rc = max(services, key=lambda n: services[n].get("http_server_error_rate", 0), default=None)
         if rc is None:
             return {"action_type": "declare_resolved"}
         state["root_cause"] = rc
@@ -183,15 +192,19 @@ def rule_based_action(obs: dict, step: int, state: dict) -> dict:
         state["last_rc"] = rc
         state["remediation_count"] = 0
 
-    # Rotation: after 3 identical remediations, re-evaluate and switch if root cause shifted
+    # Rotation: after 3 identical remediations, switch target or escalate to break deadlock
     if state.get("remediation_count", 0) >= 3:
         new_rc = find_root_cause(services, dep_graph)
         if new_rc and new_rc != state.get("last_rc"):
+            # Root cause shifted — switch target
             state["remediation_action"] = _pick_remediation(
                 new_rc, state.get("fetched_logs", {})
             )
             state["last_rc"] = new_rc
-            state["remediation_count"] = 0
+        else:
+            # Same root cause — escalate to break deadlock
+            state["remediation_action"] = {"action_type": "escalate"}
+        state["remediation_count"] = 0
 
     state["remediation_count"] = state.get("remediation_count", 0) + 1
     return state["remediation_action"]
