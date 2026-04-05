@@ -468,6 +468,7 @@ class FirewatchEnvironment(Environment):
             # --- 12. Set done/reward on observation ---
             next_obs.done = done
             next_obs.reward = round(reward, 6)
+            next_obs.episode_score = episode_score   # None unless done=True
             next_obs.metadata = info
 
             # --- 13. Update prev_obs ---

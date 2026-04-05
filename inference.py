@@ -315,9 +315,10 @@ def run_task(client: Optional[OpenAI], task_id: str, difficulty: str,
             # Update action history for next LLM prompt context
             history.append(f"Step {step} [{source}]: {action_str} → reward {reward:+.2f}")
 
-            # Pull episode score from info when done
+            # Pull episode score from obs when done
             if done:
-                score = float(info.get("episode_score", 0.0)) if isinstance(info, dict) else 0.0
+                obs_dict = result.get("observation", {}) if isinstance(result, dict) else {}
+                score = float(obs_dict.get("episode_score") or 0.0)
                 break
 
         # If loop ended without done=True, force declare_resolved to get grader score
@@ -325,7 +326,8 @@ def run_task(client: Optional[OpenAI], task_id: str, difficulty: str,
             try:
                 result = env_step({"action_type": "declare_resolved"})
                 info   = result.get("info", {})
-                score  = float(info.get("episode_score", 0.0)) if isinstance(info, dict) else 0.0
+                obs_dict = result.get("observation", {}) if isinstance(result, dict) else {}
+                score  = float(obs_dict.get("episode_score") or 0.0)
                 reward = float(result.get("reward", 0.0))
                 steps += 1
                 rewards.append(reward)

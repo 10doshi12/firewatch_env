@@ -287,6 +287,10 @@ class SystemObservation(_ObservationBase):
         default=None,
         description="Tick when user impact first reached zero. None until achieved.",
     )
+    episode_score: float | None = Field(
+        default=None,
+        description="Final grader score 0.0–1.0. Set only when done=True.",
+    )
 
 
 # --------------------------------------------------------------------------
