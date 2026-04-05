@@ -267,10 +267,12 @@ def run_task(client: Optional[OpenAI], task_id: str, difficulty: str,
     Run one task. Emits START, STEP lines. Returns (score, steps, rewards).
     END line is emitted by the caller in a finally block.
     """
-    rewards  = []
-    steps    = 0
-    score    = 0.0
-    history  = []
+    rewards      = []
+    steps        = 0
+    score        = 0.0
+    history      = []
+    llm_failures = 0          # consecutive LLM errors — after 3, use rule-based only
+    active_client = client    # may be set to None mid-task on repeated LLM failure
 
     log_start(task=task_id, env="firewatch-env", model=MODEL_NAME)
 
@@ -282,7 +284,14 @@ def run_task(client: Optional[OpenAI], task_id: str, difficulty: str,
             if result.get("done", False):
                 break
 
-            action, source, llm_error = get_action(client, obs, step, history)
+            action, source, llm_error = get_action(active_client, obs, step, history)
+
+            if llm_error is not None:
+                llm_failures += 1
+                if llm_failures >= 3:
+                    active_client = None  # rule-based only for rest of this task
+            else:
+                llm_failures = 0          # reset on success
             action_str = format_action(action)
 
             try:
