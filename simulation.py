@@ -292,7 +292,11 @@ class ServiceMesh:
 
         # 3. Update status on all services
         for svc_name, metrics in self.services.items():
-            metrics.status = derive_status(metrics)
+            metrics.status = derive_status(
+                metrics.http_server_error_rate,
+                metrics.http_server_request_duration_p99,
+                metrics.process_memory_utilization,
+            )
 
         # 4. Advance counters
         self.tick_count += 1
@@ -363,7 +367,7 @@ class ServiceMesh:
         )
 
         if svc.process_memory_utilization >= 0.98:
-            svc.http_server_error_rate = min(1.0, svc.http_server_error_rate + 0.5)
+            svc.http_server_error_rate = 1.0
             svc.restart_count += 1
             # After OOMKill, memory resets but error rate stays high
             svc.process_memory_utilization = 0.85
@@ -666,7 +670,11 @@ def generate_episode(
             + rng.random() * (RED_HERRING_ERROR_RATE_MAX - RED_HERRING_ERROR_RATE_MIN),
             4,
         )
-        rh_metrics.status = derive_status(rh_metrics)
+        rh_metrics.status = derive_status(
+            rh_metrics.http_server_error_rate,
+            rh_metrics.http_server_request_duration_p99,
+            rh_metrics.process_memory_utilization,
+        )
 
     # 9. For bad_deploy fault, mark recent deployment on root cause
     if fault_type == "bad_deploy":

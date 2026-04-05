@@ -164,7 +164,8 @@ class EpisodeResult:
     ticks_taken: int = 0
     mttm_ticks: int | None = None
     wrong_actions: int = 0
-    final_slo_budget_pct: float = 100.0
+    total_actions: int = 0
+    final_slo_budget: float = 100.0
     bad_customer_minutes: float = 0.0
 
     # Internal tracking
@@ -197,12 +198,13 @@ class EpisodeResult:
         if obs.mttm_achieved_tick is not None and self.mttm_ticks is None:
             self.mttm_ticks = obs.mttm_achieved_tick
 
-        # Track wrong actions
+        # Track actions
+        self.total_actions += 1
         if wrong_action:
             self.wrong_actions += 1
 
         # Update final values
-        self.final_slo_budget_pct = obs.slo_budget_remaining_pct
+        self.final_slo_budget = obs.slo_budget_remaining_pct
         self.bad_customer_minutes = obs.bad_customer_minutes
 
     def to_dict(self) -> dict:
@@ -213,7 +215,7 @@ class EpisodeResult:
             "ticks_taken": self.ticks_taken,
             "mttm_ticks": self.mttm_ticks,
             "wrong_actions": self.wrong_actions,
-            "final_slo_budget_pct": round(self.final_slo_budget_pct, 2),
+            "final_slo_budget": round(self.final_slo_budget, 2),
             "bad_customer_minutes": round(self.bad_customer_minutes, 2),
             "recovery_ratio": (
                 round(self.services_recovered / self.services_affected, 3)
@@ -267,7 +269,7 @@ def grade(episode_result: EpisodeResult, difficulty: str) -> float:
         # BCM score: total user impact relative to worst case
         bcm_score = max(0.0, 1.0 - (er.bad_customer_minutes / max_bcm))
         # SLO (15%) — budget remaining
-        slo = max(0.0, min(1.0, er.final_slo_budget_pct / 100.0))
+        slo = max(0.0, min(1.0, er.final_slo_budget / 100.0))
 
     # 2. Speed (25%) — composite of MTTM + BCM
     # MTTM score: how quickly user impact was zeroed

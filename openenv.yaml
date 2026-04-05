@@ -85,10 +85,14 @@ reward:
     Negative: constant time cost per tick, wrong-action penalty (remediating
     healthy services), SLO breach terminal penalty.
 
+tags:
+  - openenv
+
 tasks:
   - id: task_easy
     name: "Single Service OOM"
     difficulty: easy
+    grader_seed: 42
     description: >
       3 services, 0 red herrings, 20 tick budget. Single OOM fault on a leaf
       service. Clear log signature. Tests the fundamental
@@ -98,6 +102,7 @@ tasks:
   - id: task_medium
     name: "Cascading Deploy Failure"
     difficulty: medium
+    grader_seed: 137
     description: >
       5 services, 1 red herring, 30 tick budget. Bad deployment upstream causes
       cascading failures downstream. Agent must trace the dependency graph
@@ -107,6 +112,7 @@ tasks:
   - id: task_hard
     name: "Config Drift Noise Storm"
     difficulty: hard
+    grader_seed: 256
     description: >
       7 services, 3 red herrings, 40 tick budget. Config drift causes connection
       pool exhaustion. One red herring emits adversarial prompt injection in

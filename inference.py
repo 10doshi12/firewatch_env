@@ -41,8 +41,9 @@ except (ImportError, SystemError):
 # ---------------------------------------------------------------------------
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
 HF_TOKEN = os.getenv("HF_TOKEN", "")
+SPACE_URL = os.getenv("SPACE_URL", "http://localhost:7860")
 
 ENV_NAME = "firewatch-env"
 SUCCESS_SCORE_THRESHOLD = 0.1
@@ -264,8 +265,8 @@ def fmt_success(s: bool) -> str:
 
 
 def fmt_score(s: float) -> str:
-    """Format score to exactly 3 decimal places."""
-    return f"{s:.3f}"
+    """Format score to exactly 2 decimal places."""
+    return f"{s:.2f}"
 
 
 def fmt_rewards_list(rewards: list[float]) -> str:

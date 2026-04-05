@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -310,7 +310,7 @@ class FirewatchAction(_ActionBase):
         default=None,
         description="service_name to target. Required for all except declare_resolved/escalate.",
     )
-    parameters: dict[str, Any] = Field(
+    parameters: dict[str, object] = Field(
         default_factory=dict,
         description="Optional action params. e.g. {'memory_limit_mb': 1024} for scale_replicas.",
     )
@@ -344,9 +344,13 @@ class ActionResult(BaseModel):
 # Status derivation utility
 # --------------------------------------------------------------------------
 
-def derive_status(metrics: ServiceMetrics) -> ServiceStatus:
+def derive_status(
+    error_rate: float,
+    latency_p99: float,
+    memory_utilization: float,
+) -> ServiceStatus:
     """
-    Compute service status from current metric values.
+    Compute service status from metric values.
 
     Applied in priority order: down → critical → degraded → healthy.
     Thresholds sourced from config.py (PRD §7.2).
@@ -356,20 +360,20 @@ def derive_status(metrics: ServiceMetrics) -> ServiceStatus:
     simulation needs explicit control over when status updates happen.
     """
     if (
-        metrics.http_server_error_rate >= STATUS_THRESHOLD_DOWN_ERROR
-        or metrics.process_memory_utilization >= STATUS_THRESHOLD_DOWN_MEMORY
+        error_rate >= STATUS_THRESHOLD_DOWN_ERROR
+        or memory_utilization >= STATUS_THRESHOLD_DOWN_MEMORY
     ):
         return "down"
 
     if (
-        metrics.http_server_error_rate >= STATUS_THRESHOLD_CRITICAL_ERROR
-        or metrics.http_server_request_duration_p99 >= STATUS_THRESHOLD_CRITICAL_LATENCY
+        error_rate >= STATUS_THRESHOLD_CRITICAL_ERROR
+        or latency_p99 >= STATUS_THRESHOLD_CRITICAL_LATENCY
     ):
         return "critical"
 
     if (
-        metrics.http_server_error_rate >= STATUS_THRESHOLD_DEGRADED_ERROR
-        or metrics.http_server_request_duration_p99 >= STATUS_THRESHOLD_DEGRADED_LATENCY
+        error_rate >= STATUS_THRESHOLD_DEGRADED_ERROR
+        or latency_p99 >= STATUS_THRESHOLD_DEGRADED_LATENCY
     ):
         return "degraded"
 
