@@ -28,6 +28,10 @@ Usage:
     python -m server.app
 """
 
+from fastapi import Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
 try:
     from openenv.core.env_server.http_server import create_app
 except Exception as e:  # pragma: no cover
@@ -37,15 +41,25 @@ except Exception as e:  # pragma: no cover
 
 try:
     from ..models import FirewatchAction, SystemObservation
-    from .firewatch_env_environment import FirewatchEnvironment
+    from .firewatch_env_environment import FirewatchEnvironment, _empty_observation
 except (ImportError, SystemError):
     from models import FirewatchAction, SystemObservation
-    from server.firewatch_env_environment import FirewatchEnvironment
+    from server.firewatch_env_environment import FirewatchEnvironment, _empty_observation
+
+
+# Module-level singleton — ensures /reset and /step share state across HTTP calls.
+# openenv-core calls _env_factory() per request; returning the same instance
+# preserves episode state between /reset and /step.
+_SINGLETON_ENV = FirewatchEnvironment()
+
+
+def _env_factory() -> FirewatchEnvironment:
+    return _SINGLETON_ENV
 
 
 # Create the app with web interface and README integration
 app = create_app(
-    FirewatchEnvironment,
+    _env_factory,
     FirewatchAction,
     SystemObservation,
     env_name="firewatch_env",
@@ -53,36 +67,43 @@ app = create_app(
 )
 
 
-def main(host: str = "0.0.0.0", port: int = 8000):
+# Zero-crash policy (CLAUDE.md): invalid requests must return HTTP 200 with error
+# in the response body, never HTTP 422 or 500.
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    obs = _empty_observation(f"Invalid request: {exc.errors()}")
+    return JSONResponse(
+        status_code=200,
+        content=obs.model_dump(),
+    )
+
+
+def main():
     """
     Entry point for direct execution via uv run or python -m.
 
     This function enables running the server without Docker:
         uv run --project . server
         uv run --project . server --port 8001
+        uv run --project . server --host 0.0.0.0 --port 7860
         python -m firewatch_env.server.app
-
-    Args:
-        host: Host address to bind to (default: "0.0.0.0")
-        port: Port number to listen on (default: 8000)
 
     For production deployments, consider using uvicorn directly with
     multiple workers:
         uvicorn firewatch_env.server.app:app --workers 4
     """
+    import argparse
     import uvicorn
 
-    uvicorn.run(app, host=host, port=port)
+    parser = argparse.ArgumentParser(description="FirewatchEnv server")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
+    parser.add_argument("--port", type=int, default=8000, help="Port to listen on")
+    args = parser.parse_args()
+
+    uvicorn.run(app, host=args.host, port=args.port)
 
 
 if __name__ == '__main__':
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8000)
-    args = parser.parse_args()
-    if args.host == "0.0.0.0" and args.port == 8000:
-        main()
-    else:
-        main(host=args.host, port=args.port)
+    main()
