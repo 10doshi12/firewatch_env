@@ -202,8 +202,17 @@ def rule_based_action(obs: dict, step: int, state: dict) -> dict:
             )
             state["last_rc"] = new_rc
         else:
-            # Same root cause — escalate to break deadlock
-            state["remediation_action"] = {"action_type": "escalate"}
+            # Same root cause — cycle through alternate remediations to break deadlock
+            alternates = [
+                {"action_type": "restart_service",  "target_service": rc},
+                {"action_type": "rollback_deploy",  "target_service": rc},
+                {"action_type": "revert_config",    "target_service": rc},
+                {"action_type": "circuit_break",    "target_service": rc},
+                {"action_type": "scale_replicas",   "target_service": rc},
+            ]
+            cycle_idx = state.get("alt_cycle", 0)
+            state["remediation_action"] = alternates[cycle_idx % len(alternates)]
+            state["alt_cycle"] = cycle_idx + 1
         state["remediation_count"] = 0
 
     state["remediation_count"] = state.get("remediation_count", 0) + 1
