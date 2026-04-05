@@ -11,6 +11,7 @@ tags:
   - reinforcement-learning
   - sre
   - agentic
+base_path: /web
 ---
 
 # FirewatchEnv 🔥
