@@ -207,22 +207,24 @@ def llm_action(client: OpenAI, obs: dict, step: int, history: list) -> dict:
 # Action dispatcher — LLM-first with rule-based fallback
 # ---------------------------------------------------------------------------
 
-def get_action(client: OpenAI, obs: dict, step: int, history: list) -> tuple[dict, str]:
+def get_action(client: OpenAI, obs: dict, step: int, history: list) -> tuple[dict, str, Optional[str]]:
     """
     Try LLM first. On ANY failure, fall back to rule-based.
-    Returns (action_dict, source) where source is 'llm' or 'rule'.
+    Returns (action_dict, source, llm_error) where llm_error is None on success
+    or a short error string when the LLM call failed and rule-based was used.
     """
     if client is None or not API_KEY:
-        return rule_based_action(obs, step), "rule"
+        return rule_based_action(obs, step), "rule", None
     try:
         action = llm_action(client, obs, step, history)
         # Validate action has required keys
         if "action_type" not in action:
             raise ValueError("missing action_type")
-        return action, "llm"
+        return action, "llm", None
     except Exception as e:
-        print(f"[DEBUG] LLM fallback at step {step}: {e}", file=__import__('sys').stderr)
-        return rule_based_action(obs, step), "rule"
+        # Truncate to keep [STEP] line readable
+        err = str(e)[:120]
+        return rule_based_action(obs, step), "rule", f"llm_fallback:{err}"
 
 
 # ---------------------------------------------------------------------------
@@ -280,8 +282,8 @@ def run_task(client: Optional[OpenAI], task_id: str, difficulty: str,
             if result.get("done", False):
                 break
 
-            action, source = get_action(client, obs, step, history)
-            action_str     = format_action(action)
+            action, source, llm_error = get_action(client, obs, step, history)
+            action_str = format_action(action)
 
             try:
                 result  = env_step(action)
@@ -292,6 +294,10 @@ def run_task(client: Optional[OpenAI], task_id: str, difficulty: str,
                 error   = info.get("error") if isinstance(info, dict) else None
             except Exception as e:
                 reward, done, error = 0.0, False, str(e)
+
+            # Surface LLM fallback reason in error= field when env has no error
+            if error is None and llm_error is not None:
+                error = llm_error
 
             rewards.append(reward)
             steps = step
@@ -319,8 +325,8 @@ def run_task(client: Optional[OpenAI], task_id: str, difficulty: str,
             except Exception:
                 pass
 
-    except Exception as e:
-        print(f"[DEBUG] Task {task_id} error: {e}", file=__import__('sys').stderr)
+    except Exception:
+        pass
 
     return score, steps, rewards
 
@@ -331,9 +337,6 @@ def run_task(client: Optional[OpenAI], task_id: str, difficulty: str,
 
 def main() -> None:
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY) if API_KEY else None
-    if not API_KEY:
-        print("[DEBUG] No HF_TOKEN found — running rule-based agent only",
-              file=__import__('sys').stderr)
 
     # Task definitions — seeds must match config.py TASKS grader_seeds exactly
     tasks = [
@@ -352,9 +355,8 @@ def main() -> None:
             score, steps, rewards = run_task(client, task_id, difficulty,
                                               seed, max_ticks)
             success = score >= SUCCESS_SCORE_THRESHOLD
-        except Exception as e:
-            print(f"[DEBUG] Outer task error {task_id}: {e}",
-                  file=__import__('sys').stderr)
+        except Exception:
+            pass
         finally:
             log_end(success=success, steps=steps, score=score, rewards=rewards)
 
