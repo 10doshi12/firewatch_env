@@ -83,59 +83,118 @@ SYSTEM_PROMPT = textwrap.dedent("""
 # Rule-based fallback agent — deterministic, no API calls
 # ---------------------------------------------------------------------------
 
-def rule_based_action(obs: dict, step: int) -> dict:
+def find_root_cause(services: dict, dep_graph: dict) -> Optional[str]:
     """
-    Deterministic heuristic agent. No API calls. Always produces a valid action.
+    Identify root cause using dependency topology + error rates.
+
+    Scores each degraded service: base = error_rate.
+    +0.5 bonus for each other degraded service that depends on it (upstream cause).
+    """
+    if not services:
+        return None
+    degraded = {
+        name: m.get("http_server_error_rate", 0)
+        for name, m in services.items()
+        if m.get("http_server_error_rate", 0) >= 0.10
+    }
+    if not degraded:
+        return None
+    scores: dict[str, float] = {}
+    for name in degraded:
+        score = degraded[name]
+        for other in degraded:
+            if other != name and name in dep_graph.get(other, []):
+                score += 0.5
+        scores[name] = score
+    return max(scores, key=lambda k: scores[k])
+
+
+def _pick_remediation(service_name: str, fetched_logs: dict) -> dict:
+    """Pick remediation action based on log keywords for the service."""
+    logs = fetched_logs.get(service_name, [])
+    log_text = " ".join(logs).lower()
+    if "oomkilled" in log_text or "exit code 137" in log_text or "memory limit" in log_text:
+        return {"action_type": "restart_service", "target_service": service_name}
+    if "nullpointerexception" in log_text or "deploy" in log_text or "version" in log_text:
+        return {"action_type": "rollback_deploy", "target_service": service_name}
+    if "hikaripool" in log_text or "connection pool" in log_text or "timed out after" in log_text:
+        return {"action_type": "revert_config", "target_service": service_name}
+    if "connection refused" in log_text or "circuit breaker" in log_text:
+        return {"action_type": "circuit_break", "target_service": service_name}
+    if "memory leak" in log_text or "high latency" in log_text:
+        return {"action_type": "scale_replicas", "target_service": service_name}
+    return {"action_type": "restart_service", "target_service": service_name}
+
+
+def rule_based_action(obs: dict, step: int, state: dict) -> dict:
+    """
+    Stateful heuristic agent. Uses state dict to track investigation findings.
     Decision tree:
-      step 1   → fetch_logs on highest error_rate service
-      step 2   → fetch_logs on second highest error_rate service
-      step 3   → trace_dependencies on highest error_rate service
-      step 4-9 → remediate based on log keyword matching
-      step 10+ → declare_resolved
+      step 1   → fetch_logs on topology root cause
+      step 2   → fetch_logs on second degraded service (or trace if only one)
+      step 3   → trace_dependencies on root cause
+      step 4+  → remediate root cause (re-evaluated each step)
+                 rotation: if same action applied 3x → switch to next candidate
+      step 12+ → declare_resolved
     """
     services = obs.get("services", {})
+    dep_graph = obs.get("dependency_graph", {})
+
     if not services:
         return {"action_type": "declare_resolved"}
 
-    # Rank services by error_rate descending, skip healthy ones for remediation
-    ranked = sorted(
-        services.items(),
-        key=lambda x: x[1].get("http_server_error_rate", 0),
-        reverse=True
-    )
-    top_service  = ranked[0][0] if len(ranked) > 0 else None
-    sec_service  = ranked[1][0] if len(ranked) > 1 else top_service
-
-    # Investigation phase
     if step == 1:
-        return {"action_type": "fetch_logs", "target_service": top_service}
+        rc = find_root_cause(services, dep_graph)
+        if rc is None:
+            return {"action_type": "declare_resolved"}
+        state["root_cause"] = rc
+        return {"action_type": "fetch_logs", "target_service": rc}
+
     if step == 2:
-        return {"action_type": "fetch_logs", "target_service": sec_service}
+        ranked_degraded = sorted(
+            [(name, m.get("http_server_error_rate", 0))
+             for name, m in services.items()
+             if m.get("http_server_error_rate", 0) >= 0.10],
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        rc = state.get("root_cause")
+        sec = next((name for name, _ in ranked_degraded if name != rc), None)
+        if sec:
+            return {"action_type": "fetch_logs", "target_service": sec}
+        return (
+            {"action_type": "trace_dependencies", "target_service": rc}
+            if rc else {"action_type": "declare_resolved"}
+        )
+
     if step == 3:
-        return {"action_type": "trace_dependencies", "target_service": top_service}
+        rc = state.get("root_cause") or find_root_cause(services, dep_graph)
+        if rc is None:
+            return {"action_type": "declare_resolved"}
+        return {"action_type": "trace_dependencies", "target_service": rc}
 
-    # Remediation phase — read logs for fault type signal
-    if step <= 9:
-        logs = services.get(top_service, {}).get("recent_logs", [])
-        log_text = " ".join(logs).lower()
+    # Remediation phase (step 4+): re-evaluate root cause from latest obs
+    rc = find_root_cause(services, dep_graph)
+    if rc is None:
+        return {"action_type": "declare_resolved"}
 
-        # Keyword → correct remediation mapping (mirrors fault types)
-        if "oomkilled" in log_text or "exit code 137" in log_text or "memory limit" in log_text:
-            return {"action_type": "restart_service", "target_service": top_service}
-        if "nullpointerexception" in log_text or "deploy" in log_text or "version" in log_text:
-            return {"action_type": "rollback_deploy", "target_service": top_service}
-        if "hikaripool" in log_text or "connection pool" in log_text or "timed out after" in log_text:
-            return {"action_type": "revert_config", "target_service": top_service}
-        if "connection refused" in log_text or "circuit breaker" in log_text:
-            return {"action_type": "circuit_break", "target_service": top_service}
-        if "memory leak" in log_text or "high latency" in log_text:
-            return {"action_type": "scale_replicas", "target_service": top_service}
+    if rc != state.get("last_rc") or "remediation_action" not in state:
+        state["remediation_action"] = _pick_remediation(rc, state.get("fetched_logs", {}))
+        state["last_rc"] = rc
+        state["remediation_count"] = 0
 
-        # No log signal — default: restart highest error service if it's truly degraded
-        if ranked[0][1].get("http_server_error_rate", 0) >= 0.10:
-            return {"action_type": "restart_service", "target_service": top_service}
+    # Rotation: after 3 identical remediations, re-evaluate and switch if root cause shifted
+    if state.get("remediation_count", 0) >= 3:
+        new_rc = find_root_cause(services, dep_graph)
+        if new_rc and new_rc != state.get("last_rc"):
+            state["remediation_action"] = _pick_remediation(
+                new_rc, state.get("fetched_logs", {})
+            )
+            state["last_rc"] = new_rc
+            state["remediation_count"] = 0
 
-    return {"action_type": "declare_resolved"}
+    state["remediation_count"] = state.get("remediation_count", 0) + 1
+    return state["remediation_action"]
 
 
 # ---------------------------------------------------------------------------
@@ -207,24 +266,24 @@ def llm_action(client: OpenAI, obs: dict, step: int, history: list) -> dict:
 # Action dispatcher — LLM-first with rule-based fallback
 # ---------------------------------------------------------------------------
 
-def get_action(client: OpenAI, obs: dict, step: int, history: list) -> tuple[dict, str, Optional[str]]:
+def get_action(
+    client: Optional[OpenAI], obs: dict, step: int, history: list, state: dict
+) -> tuple[dict, str, Optional[str]]:
     """
     Try LLM first. On ANY failure, fall back to rule-based.
     Returns (action_dict, source, llm_error) where llm_error is None on success
     or a short error string when the LLM call failed and rule-based was used.
     """
     if client is None or not API_KEY:
-        return rule_based_action(obs, step), "rule", None
+        return rule_based_action(obs, step, state), "rule", None
     try:
         action = llm_action(client, obs, step, history)
-        # Validate action has required keys
         if "action_type" not in action:
             raise ValueError("missing action_type")
         return action, "llm", None
     except Exception as e:
-        # Truncate to keep [STEP] line readable
         err = str(e)[:120]
-        return rule_based_action(obs, step), "rule", f"llm_fallback:{err}"
+        return rule_based_action(obs, step, state), "rule", f"llm_fallback:{err}"
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +330,7 @@ def run_task(client: Optional[OpenAI], task_id: str, difficulty: str,
     steps        = 0
     score        = 0.0
     history      = []
+    state        = {"fetched_logs": {}}   # shared agent state across steps
     llm_failures = 0          # consecutive LLM errors — after 3, use rule-based only
     active_client = client    # may be set to None mid-task on repeated LLM failure
 
@@ -284,7 +344,7 @@ def run_task(client: Optional[OpenAI], task_id: str, difficulty: str,
             if result.get("done", False):
                 break
 
-            action, source, llm_error = get_action(active_client, obs, step, history)
+            action, source, llm_error = get_action(active_client, obs, step, history, state)
 
             if llm_error is not None:
                 llm_failures += 1
@@ -301,6 +361,13 @@ def run_task(client: Optional[OpenAI], task_id: str, difficulty: str,
                 obs     = result.get("observation") or obs
                 info    = result.get("info", {})
                 error   = info.get("error") if isinstance(info, dict) else None
+                # Capture fetched logs for stateful rule-based remediation decisions
+                if action.get("action_type") == "fetch_logs":
+                    target = action.get("target_service")
+                    if target and isinstance(obs, dict):
+                        logs = obs.get("services", {}).get(target, {}).get("recent_logs", [])
+                        if logs:
+                            state["fetched_logs"][target] = logs
             except Exception as e:
                 reward, done, error = 0.0, False, str(e)
 
