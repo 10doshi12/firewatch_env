@@ -65,14 +65,15 @@ COPY --from=builder /app/env/.venv /app/.venv
 # Copy the environment code
 COPY --from=builder /app/env /app/env
 
-# Copy README to the path openenv-core expects in the container
-COPY --from=builder /app/env/README.md /app/README.md
-
 # Set PATH to use the virtual environment
 ENV PATH="/app/.venv/bin:$PATH"
 
 # Set PYTHONPATH so imports work correctly
 ENV PYTHONPATH="/app/env:$PYTHONPATH"
+
+# server/README.md is a copy of the project README, kept here so it survives
+# HuggingFace Spaces stripping the root README.md from the Docker build context.
+ENV ENV_README_PATH="/app/env/server/README.md"
 
 EXPOSE 7860
 
