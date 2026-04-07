@@ -106,13 +106,18 @@ class IncidentMetrics:
     bad_customer_minutes: float = 0.0
     mttm_achieved_tick: int | None = None
     _mttm_locked: bool = field(default=False, repr=False)
+    _zero_bcm_streak: int = field(default=0, repr=False)
 
     def update(self, bcm_delta: float, current_tick: int) -> None:
-        """Update BCM and check MTTM achievement."""
+        """Update BCM and check MTTM achievement (requires 3 consecutive zero-BCM ticks)."""
         self.bad_customer_minutes += bcm_delta
-        if bcm_delta <= 0.0 and not self._mttm_locked and current_tick > 0:
-            self.mttm_achieved_tick = current_tick
-            self._mttm_locked = True
+        if bcm_delta <= 0.0 and current_tick > 0:
+            self._zero_bcm_streak += 1
+            if self._zero_bcm_streak >= 3 and not self._mttm_locked:
+                self.mttm_achieved_tick = current_tick - 2
+                self._mttm_locked = True
+        else:
+            self._zero_bcm_streak = 0
 
 
 # ==========================================================================
@@ -709,6 +714,29 @@ def generate_episode(
     return mesh, fault_config
 
 
+def _count_blast_radius(mesh: "ServiceMesh", fault_config: "FaultConfig") -> int:
+    """
+    Count services that will be affected by this fault at full cascade propagation.
+
+    Uses BFS through the dependency graph from root cause service.
+    Used as static denominator in grade() to prevent tick-0 exploit.
+
+    Returns:
+        max(1, number of services reachable from root cause within CASCADE_MAX_DEPTH hops)
+    """
+    affected: set[str] = {fault_config.root_cause_service}
+    frontier: list[str] = [fault_config.root_cause_service]
+    for _ in range(CASCADE_MAX_DEPTH):
+        next_frontier: list[str] = []
+        for svc in frontier:
+            for downstream, deps in mesh.dependency_graph.items():
+                if svc in deps and downstream not in affected:
+                    affected.add(downstream)
+                    next_frontier.append(downstream)
+        frontier = next_frontier
+    return max(1, len(affected))
+
+
 # ==========================================================================
 # Public API
 # ==========================================================================
@@ -718,4 +746,5 @@ __all__ = [
     "IncidentMetrics",
     "ServiceMesh",
     "generate_episode",
+    "_count_blast_radius",
 ]

@@ -96,9 +96,9 @@ class RewardEngine:
         Returns:
             Tuple of (total_reward, breakdown_dict).
         """
-        # 1. Health improvement: mean error rate decrease
-        prev_mean = _mean_error_rate(prev_obs)
-        next_mean = _mean_error_rate(next_obs)
+        # 1. Health improvement: weighted mean error rate decrease
+        prev_mean = _weighted_mean_error_rate(prev_obs.services, prev_obs.dependency_graph)
+        next_mean = _weighted_mean_error_rate(next_obs.services, next_obs.dependency_graph)
         health_improvement = (prev_mean - next_mean) * REWARD_WEIGHT_HEALTH
 
         # 2. SLO preservation: budget change
@@ -257,27 +257,25 @@ def grade(episode_result: EpisodeResult, difficulty: str) -> float:
     if task is None:
         return 0.0
 
+    # Fix 1: Tick guard — declare_resolved before tick 2 earns near-zero score
+    if er.ticks_taken < 2:
+        return 0.05
+
     max_ticks = task.max_ticks
     max_bcm = task.max_bad_customer_minutes
 
     # 1. Recovery (40%)
-    if er.services_affected > 0:
-        recovery = er.services_recovered / er.services_affected
-    else:
-        recovery = 1.0  # No affected services = perfect recovery
+    # The tick guard above handles Fix 1 (tick-0 exploit).
+    # Use runtime services_affected as denominator — blast penalty (below) is what
+    # differentiates agents who contained vs didn't contain the cascade.
+    denominator = er.services_affected or 1
+    recovery = min(1.0, er.services_recovered / denominator)
 
-    # Penalize early exit without fix: if the agent gave up, assume worst case for BCM and SLO
-    if recovery < 1.0 and er.ticks_taken < max_ticks:
-        bcm_score = 0.0
-        slo = 0.0
-    else:
-        # BCM score: total user impact relative to worst case
-        bcm_score = max(0.0, 1.0 - (er.bad_customer_minutes / max_bcm))
-        # SLO (15%) — budget remaining
-        slo = max(0.0, min(1.0, er.final_slo_budget / 100.0))
+    # Fix 2: No cliff wipe — compute BCM and SLO unconditionally
+    bcm_score = max(0.0, 1.0 - (er.bad_customer_minutes / max_bcm))
+    slo = max(0.0, min(1.0, er.final_slo_budget / 100.0))
 
     # 2. Speed (25%) — composite of MTTM + BCM
-    # MTTM score: how quickly user impact was zeroed
     if er.mttm_ticks is not None:
         mttm_score = max(0.0, 1.0 - (er.mttm_ticks / max_ticks))
     else:
@@ -292,19 +290,25 @@ def grade(episode_result: EpisodeResult, difficulty: str) -> float:
     precision = max(
         0.0, 1.0 - (er.wrong_actions * GRADER_WRONG_ACTION_PENALTY_PER_ACTION)
     )
-    
+
     # False resolution penalty
     if recovery == 0.0:
         precision = 0.0  # doing nothing then exiting is inherently imprecise
 
-    # Final weighted score
-    score = (
+    # Raw weighted score
+    raw = (
         GRADER_WEIGHT_RECOVERY * recovery
         + GRADER_WEIGHT_SPEED * speed
         + GRADER_WEIGHT_PRECISION * precision
         + GRADER_WEIGHT_SLO * slo
     )
 
+    # Fix 3: Blast radius penalty — reward containing cascade, not just fixing it
+    total_services = er.total_services_in_episode or denominator
+    blast_ratio = er.services_affected / total_services if total_services > 0 else 0.0
+    blast_penalty = blast_ratio * 0.02
+
+    score = max(0.0, raw - blast_penalty)
     return max(0.01, min(0.99, round(score, 2)))
 
 
@@ -417,69 +421,63 @@ def _build_semantic_analysis(
     prev_obs: SystemObservation,
     recovering: list[str],
 ) -> str:
-    """Generate contextual narrative for the LLM judge."""
+    """
+    Generate metric-delta context for the step info dict.
+
+    Reports WHAT changed (metric values and deltas), not WHETHER it was good.
+    The agent must interpret the numbers itself — no outcome framing.
+    """
     parts: list[str] = []
 
     if not action_valid:
         parts.append(
-            f"Agent attempted '{action.action_type}' but the action was "
-            f"invalid. No system state was modified."
+            f"Action '{action.action_type}' was invalid. No state change."
         )
     elif wrong_action:
+        # Report metric context only — no interpretation
+        svc = action.target_service or ""
+        curr_er = next_obs.services[svc].http_server_error_rate if svc in next_obs.services else None
+        er_str = f"error_rate={curr_er:.2f}" if curr_er is not None else "error_rate=unknown"
         parts.append(
-            f"Agent applied '{action.action_type}' to "
-            f"'{action.target_service}' which was not significantly degraded. "
-            f"This indicates premature remediation before sufficient "
-            f"investigation. The actual root cause remains unaddressed."
+            f"Action '{action.action_type}' targeted '{svc}' ({er_str}). "
+            f"Wrong-action penalty applied (threshold: 0.10)."
         )
     elif action.action_type in ("fetch_logs", "get_metrics_detail", "trace_dependencies"):
         parts.append(
-            f"Agent performed investigation: '{action.action_type}' on "
-            f"'{action.target_service}'. This is an information-gathering "
-            f"step that does not modify system state."
+            f"Investigation '{action.action_type}' on '{action.target_service}'. "
+            f"No state mutation."
         )
-    elif action.action_type in ("restart_service", "rollback_deploy", "revert_config", "scale_replicas", "circuit_break"):
-        parts.append(
-            f"Agent applied remediation: '{action.action_type}' to "
-            f"'{action.target_service}'."
-        )
-        if recovering:
-            parts.append(
-                f"System health is improving — services recovering: "
-                f"{recovering}."
-            )
-        else:
-            parts.append(
-                f"No immediate improvement observed. The remediation may "
-                f"need time to take effect, or it may be targeting the "
-                f"wrong service/fault type."
-            )
+    elif action.action_type in (
+        "restart_service", "rollback_deploy", "revert_config",
+        "scale_replicas", "circuit_break",
+    ):
+        parts.append(f"Remediation '{action.action_type}' applied to '{action.target_service}'.")
+        # Report metric deltas — no interpretation of good/bad
+        if prev_obs:
+            for svc_name, curr in next_obs.services.items():
+                prev_svc = prev_obs.services.get(svc_name)
+                if prev_svc:
+                    delta = curr.http_server_error_rate - prev_svc.http_server_error_rate
+                    if abs(delta) > 0.05:
+                        direction = "increased" if delta > 0 else "decreased"
+                        parts.append(
+                            f"{svc_name} error_rate {direction} by {abs(delta):.2f} "
+                            f"(now {curr.http_server_error_rate:.2f})."
+                        )
     elif action.action_type == "declare_resolved":
-        parts.append("Agent declared the incident resolved. Episode ending.")
+        parts.append("Agent declared incident resolved. Episode ending.")
     elif action.action_type == "escalate":
-        parts.append(
-            "Agent escalated the incident. This costs SLO budget but "
-            "brings specialist attention."
-        )
+        parts.append("Agent escalated incident.")
 
-    # Overall state assessment
-    degraded_count = sum(
-        1 for m in next_obs.services.values() if m.status != "healthy"
-    )
+    # Current state counts — factual only
+    degraded_count = sum(1 for m in next_obs.services.values() if m.status != "healthy")
     total = len(next_obs.services)
-    if degraded_count == 0:
-        parts.append("All services are now healthy.")
-    elif degraded_count == total:
-        parts.append(
-            "All services are degraded — situation is critical. "
-            "Immediate action required."
-        )
-    else:
-        parts.append(
-            f"{degraded_count}/{total} services remain degraded."
-        )
+    parts.append(f"{degraded_count}/{total} services non-healthy.")
 
-    return " ".join(parts)
+    if feedback:
+        parts.append(f"Feedback: {feedback}")
+
+    return " ".join(parts) if parts else "No significant changes this tick."
 
 
 def _assess_progress(obs: SystemObservation, done: bool) -> str:
@@ -506,6 +504,41 @@ def _assess_progress(obs: SystemObservation, done: bool) -> str:
 # ==========================================================================
 # Helper
 # ==========================================================================
+
+def _weighted_mean_error_rate(services: dict, dependency_graph: dict) -> float:
+    """
+    Compute mean error rate across services, weighted by downstream dependent count.
+
+    Weight formula: weight(svc) = 1 + count(other services that list svc as a dependency)
+    Example: api-gateway with 3 dependents → weight=4; cache leaf → weight=1.
+
+    Args:
+        services: Dict mapping service_name → ServiceMetrics (must have http_server_error_rate).
+        dependency_graph: Dict mapping service_name → list[dependency_name].
+
+    Returns:
+        Weighted mean error rate in [0.0, 1.0].
+    """
+    if not services:
+        return 0.0
+
+    # Count how many services-in-this-episode depend on each service
+    dependent_count: dict[str, int] = {svc: 0 for svc in services}
+    for svc, deps in dependency_graph.items():
+        if svc in services:
+            for dep in deps:
+                if dep in dependent_count:
+                    dependent_count[dep] = dependent_count.get(dep, 0) + 1
+
+    total_weight = 0.0
+    weighted_error = 0.0
+    for svc_name, metrics in services.items():
+        weight = 1 + dependent_count.get(svc_name, 0)
+        weighted_error += metrics.http_server_error_rate * weight
+        total_weight += weight
+
+    return weighted_error / total_weight if total_weight > 0 else 0.0
+
 
 def _mean_error_rate(obs: SystemObservation) -> float:
     """Compute mean error rate across all services in observation."""
