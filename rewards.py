@@ -244,7 +244,8 @@ def grade(episode_result: EpisodeResult, difficulty: str) -> float:
         difficulty: "easy", "medium", or "hard" — for max_ticks lookup.
 
     Returns:
-        Float between 0.0 and 1.0.
+        Float in the open interval (0.0, 1.0) — exclusive of both endpoints.
+        Rounded to 2 decimal places. Minimum 0.01, maximum 0.99.
     """
     er = episode_result
     task_key = f"task_{difficulty}"
@@ -300,7 +301,7 @@ def grade(episode_result: EpisodeResult, difficulty: str) -> float:
         + GRADER_WEIGHT_SLO * slo
     )
 
-    return max(0.0, min(1.0, score))
+    return max(0.01, min(0.99, round(score, 2)))
 
 
 # ==========================================================================

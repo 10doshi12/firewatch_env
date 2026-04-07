@@ -289,7 +289,7 @@ class SystemObservation(_ObservationBase):
     )
     episode_score: float | None = Field(
         default=None,
-        description="Final grader score 0.0–1.0. Set only when done=True.",
+        description="Final grader score in (0.0, 1.0) exclusive. Set only when done=True.",
     )
 
 
