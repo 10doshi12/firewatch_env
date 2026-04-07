@@ -152,7 +152,10 @@ def log_end(success: bool, steps: int, score: float, rewards: list) -> None:
 
 def parse_llm_response(response: str, services: list) -> dict:
     """
-    Parse an LLM text response into an action dict.
+    Parse an LLM text response into an action dict matching FirewatchAction schema:
+      - action_type: str  (required)
+      - target_service: str | None  (default None)
+      - parameters: dict  (default {})
 
     Tries JSON extraction first (handles markdown fences and embedded JSON).
     Falls back to fetch_logs on the first service in the services list if parsing fails.
@@ -169,13 +172,17 @@ def parse_llm_response(response: str, services: list) -> dict:
         try:
             data = json.loads(json_match.group())
             if "action_type" in data:
-                return data
+                return {
+                    "action_type": data["action_type"],
+                    "target_service": data.get("target_service", None),
+                    "parameters": data.get("parameters", {}),
+                }
         except Exception:
             pass
 
     # Fallback: fetch_logs on first available service
     fallback_service = services[0] if services else None
-    return {"action_type": "fetch_logs", "target_service": fallback_service}
+    return {"action_type": "fetch_logs", "target_service": fallback_service, "parameters": {}}
 
 
 # ---------------------------------------------------------------------------

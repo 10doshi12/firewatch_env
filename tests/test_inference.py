@@ -86,11 +86,12 @@ def test_format_action():
 
 
 def test_parse_json_response():
-    """Parse clean JSON response."""
+    """Parse clean JSON response — dict matches FirewatchAction schema."""
     resp = '{"action_type": "restart_service", "target_service": "cache"}'
     action = parse_llm_response(resp, ["cache", "db"])
-    assert action.action_type == "restart_service"
-    assert action.target_service == "cache"
+    assert action["action_type"] == "restart_service"
+    assert action["target_service"] == "cache"
+    assert action["parameters"] == {}
     print("✓ test_parse_json_response PASSED")
 
 
@@ -98,17 +99,19 @@ def test_parse_markdown_wrapped():
     """Parse JSON wrapped in markdown code blocks."""
     resp = '```json\n{"action_type": "fetch_logs", "target_service": "db"}\n```'
     action = parse_llm_response(resp, ["cache", "db"])
-    assert action.action_type == "fetch_logs"
-    assert action.target_service == "db"
+    assert action["action_type"] == "fetch_logs"
+    assert action["target_service"] == "db"
+    assert action["parameters"] == {}
     print("✓ test_parse_markdown_wrapped PASSED")
 
 
 def test_parse_fallback():
-    """Fallback to fetch_logs on unparseable response."""
+    """Fallback to fetch_logs on unparseable response — dict matches FirewatchAction schema."""
     resp = "I think we should restart the auth service because of high latency"
     action = parse_llm_response(resp, ["auth-service", "db"])
-    assert action.action_type == "fetch_logs"
-    assert action.target_service == "auth-service"
+    assert action["action_type"] == "fetch_logs"
+    assert action["target_service"] == "auth-service"
+    assert action["parameters"] == {}
     print("✓ test_parse_fallback PASSED")
 
 
@@ -116,8 +119,9 @@ def test_parse_with_extra_text():
     """Parse JSON embedded in explanation text."""
     resp = 'Based on the metrics, I recommend:\n\n{"action_type": "rollback_deploy", "target_service": "api-gateway"}\n\nThis should fix the issue.'
     action = parse_llm_response(resp, ["api-gateway"])
-    assert action.action_type == "rollback_deploy"
-    assert action.target_service == "api-gateway"
+    assert action["action_type"] == "rollback_deploy"
+    assert action["target_service"] == "api-gateway"
+    assert action["parameters"] == {}
     print("✓ test_parse_with_extra_text PASSED")
 
 
