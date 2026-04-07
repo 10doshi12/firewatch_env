@@ -9,9 +9,8 @@ __pycache__/
 .gitignore
 inference.py
 client.py
-README.md
-readme.md
 *.md
+!README.md
 openenv_firewatch_env.egg-info/
 .venv/
 *.log
