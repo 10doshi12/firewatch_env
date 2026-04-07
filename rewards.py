@@ -168,6 +168,10 @@ class EpisodeResult:
     final_slo_budget: float = 100.0
     bad_customer_minutes: float = 0.0
 
+    # Static episode-level counts set once in reset() — never mutated by update()
+    services_affected_static: int = 0    # predicted blast radius from FaultConfig BFS
+    total_services_in_episode: int = 0   # total services active in this episode
+
     # Internal tracking
     _affected_services: set[str] = field(default_factory=set, repr=False)
     _recovered_services: set[str] = field(default_factory=set, repr=False)
