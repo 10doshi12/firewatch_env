@@ -28,6 +28,10 @@ from inference import (
 from models import FirewatchAction
 from server.firewatch_env_environment import FirewatchEnvironment
 
+import urllib.error
+from unittest.mock import patch, MagicMock
+from inference import resolve_server_url, DEFAULT_SPACE_URL
+
 
 def test_format_reward():
     """Reward formatted to exactly 2 decimal places."""
@@ -197,6 +201,81 @@ def test_system_prompt_completeness():
     print("✓ test_system_prompt_completeness PASSED")
 
 
+# ---------------------------------------------------------------------------
+# resolve_server_url() tests
+# ---------------------------------------------------------------------------
+
+def _make_resp_200() -> MagicMock:
+    """Context-manager-compatible mock HTTP response with status 200."""
+    m = MagicMock()
+    m.status = 200
+    m.__enter__ = lambda s: m
+    m.__exit__ = MagicMock(return_value=False)
+    return m
+
+
+def _urlopen_ok_for(*ok_substrings: str):
+    """Return a urlopen mock that returns 200 if url contains any ok_substring, raises otherwise."""
+    def _inner(url, timeout):
+        for substr in ok_substrings:
+            if substr in url:
+                return _make_resp_200()
+        raise urllib.error.URLError("connection refused")
+    return _inner
+
+
+def test_resolve_prefers_localhost_8000():
+    """localhost:8000 up → returns http://localhost:8000 regardless of other candidates."""
+    env_patch = {"SPACE_URL": "https://some-other-space.hf.space"}
+    with patch("urllib.request.urlopen", side_effect=_urlopen_ok_for("localhost:8000")):
+        with patch.dict(os.environ, env_patch):
+            result = resolve_server_url()
+    assert result == "http://localhost:8000"
+    print("✓ test_resolve_prefers_localhost_8000 PASSED")
+
+
+def test_resolve_falls_back_to_7860():
+    """localhost:8000 down, localhost:7860 up → returns http://localhost:7860."""
+    with patch("urllib.request.urlopen", side_effect=_urlopen_ok_for("localhost:7860")):
+        with patch.dict(os.environ, {"SPACE_URL": ""}, clear=False):
+            result = resolve_server_url()
+    assert result == "http://localhost:7860"
+    print("✓ test_resolve_falls_back_to_7860 PASSED")
+
+
+def test_resolve_uses_space_url_env():
+    """Both local servers down, SPACE_URL env var set and reachable → returns SPACE_URL."""
+    custom = "https://custom-space.hf.space"
+    with patch("urllib.request.urlopen", side_effect=_urlopen_ok_for("custom-space")):
+        with patch.dict(os.environ, {"SPACE_URL": custom}):
+            result = resolve_server_url()
+    assert result == custom
+    print("✓ test_resolve_uses_space_url_env PASSED")
+
+
+def test_resolve_falls_back_to_default():
+    """All local servers down, no SPACE_URL set, default HF Space reachable → returns default."""
+    with patch("urllib.request.urlopen", side_effect=_urlopen_ok_for("10doshi12-firewatch-env")):
+        with patch.dict(os.environ, {"SPACE_URL": ""}, clear=False):
+            result = resolve_server_url()
+    assert result == DEFAULT_SPACE_URL
+    print("✓ test_resolve_falls_back_to_default PASSED")
+
+
+def test_resolve_never_raises_when_all_fail():
+    """All probes fail → returns DEFAULT_SPACE_URL without raising; probed at least 3 candidates."""
+    def _all_fail(url, timeout):
+        raise urllib.error.URLError("all down")
+
+    with patch("urllib.request.urlopen", side_effect=_all_fail) as mock_open:
+        with patch.dict(os.environ, {"SPACE_URL": ""}, clear=False):
+            result = resolve_server_url()
+    assert result == DEFAULT_SPACE_URL
+    # Must have tried at least: localhost:8000, localhost:7860, DEFAULT_SPACE_URL
+    assert mock_open.call_count >= 3, f"Expected ≥3 probe attempts, got {mock_open.call_count}"
+    print("✓ test_resolve_never_raises_when_all_fail PASSED")
+
+
 if __name__ == "__main__":
     tests = [
         test_format_reward,
@@ -212,6 +291,11 @@ if __name__ == "__main__":
         test_summarize_under_400_tokens,
         test_stdout_format_compliance,
         test_system_prompt_completeness,
+        test_resolve_prefers_localhost_8000,
+        test_resolve_falls_back_to_7860,
+        test_resolve_uses_space_url_env,
+        test_resolve_falls_back_to_default,
+        test_resolve_never_raises_when_all_fail,
     ]
 
     passed = 0

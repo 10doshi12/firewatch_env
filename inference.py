@@ -29,11 +29,100 @@ API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME   = os.getenv("MODEL_NAME",   "Qwen/Qwen2.5-7B-Instruct")
 API_KEY      = os.getenv("HF_TOKEN")
 SPACE_URL    = os.getenv("SPACE_URL",    "http://localhost:7860")
+DEFAULT_SPACE_URL = "https://10doshi12-firewatch-env.hf.space"
+
+
+def resolve_server_url() -> str:
+    """
+    Auto-detect the best available FirewatchEnv server.
+
+    Probe order (first healthy response wins):
+      1. http://localhost:8000   — local dev server (uv run server)
+      2. http://localhost:7860   — local Docker container
+      3. SPACE_URL env var       — explicit HF Space URL if set
+      4. DEFAULT_SPACE_URL       — hardcoded fallback
+
+    Local probes timeout after 1.5s (instant fail if not running).
+    HF Space probes timeout after 60s (accounts for cold start).
+    Never raises — all exceptions are caught and the next candidate is tried.
+    Always returns a valid URL string.
+    """
+    import urllib.error
+
+    space_url_env = os.getenv("SPACE_URL", "").rstrip("/")
+    candidates: list[tuple[str, float]] = [
+        ("http://localhost:8000", 1.5),
+        ("http://localhost:7860", 1.5),
+    ]
+    seen = {c[0] for c in candidates}
+    if space_url_env and space_url_env not in seen:
+        candidates.append((space_url_env, 60.0))
+        seen.add(space_url_env)
+    if DEFAULT_SPACE_URL not in seen:
+        candidates.append((DEFAULT_SPACE_URL, 60.0))
+
+    for base_url, timeout in candidates:
+        try:
+            with urllib.request.urlopen(
+                f"{base_url}/health", timeout=timeout
+            ) as resp:
+                if resp.status == 200:
+                    return base_url
+        except Exception:
+            continue
+
+    return DEFAULT_SPACE_URL
+
 
 MAX_STEPS              = 12     # hard cap — never more than 12 API calls per task
 SUCCESS_SCORE_THRESHOLD = 0.1
 TEMPERATURE            = 0.0   # deterministic LLM output — same prompt → same response
 MAX_TOKENS             = 150   # just enough for one JSON action object
+
+
+# ---------------------------------------------------------------------------
+# Format helpers — exact output format required by evaluation system
+# ---------------------------------------------------------------------------
+
+def fmt_reward(value: Optional[float]) -> str:
+    """Format reward to exactly 2 decimal places. None → '0.00'."""
+    if value is None:
+        return "0.00"
+    return f"{value:.2f}"
+
+
+def fmt_done(value: bool) -> str:
+    """Format bool as lowercase 'true'/'false'."""
+    return "true" if value else "false"
+
+
+def fmt_success(value: bool) -> str:
+    """Format bool as lowercase 'true'/'false'."""
+    return "true" if value else "false"
+
+
+def fmt_score(value: float) -> str:
+    """Format score to exactly 3 decimal places."""
+    return f"{value:.3f}"
+
+
+def fmt_rewards_list(rewards: list) -> str:
+    """Format list of rewards as comma-separated 2-decimal strings."""
+    return ",".join(f"{r:.2f}" for r in rewards)
+
+
+def fmt_action(action) -> str:
+    """
+    Format action for the STEP line action= field.
+    Accepts FirewatchAction objects or plain dicts.
+    """
+    if hasattr(action, "action_type"):
+        atype = action.action_type
+        target = action.target_service
+    else:
+        atype = action.get("action_type", "unknown")
+        target = action.get("target_service")
+    return f"{atype}:{target}" if target else str(atype)
 
 
 # ---------------------------------------------------------------------------
@@ -49,9 +138,136 @@ def log_step(step: int, action: str, reward: float, done: bool, error: Optional[
     print(f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}", flush=True)
 
 def log_end(success: bool, steps: int, score: float, rewards: list) -> None:
-    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
-    success_val = "true" if success else "false"
-    print(f"[END] success={success_val} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
+    rewards_str = fmt_rewards_list(rewards)
+    success_val = fmt_success(success)
+    print(f"[END] success={success_val} steps={steps} score={fmt_score(score)} rewards={rewards_str}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# LLM response parser
+# ---------------------------------------------------------------------------
+
+def parse_llm_response(response: str, services: list) -> "FirewatchAction":
+    """
+    Parse an LLM text response into a FirewatchAction.
+
+    Tries JSON extraction first (handles markdown fences and embedded JSON).
+    Falls back to fetch_logs on the first service in the services list if parsing fails.
+    Never raises.
+    """
+    try:
+        from models import FirewatchAction
+    except ImportError:
+        try:
+            from firewatch_env.models import FirewatchAction
+        except ImportError:
+            pass
+
+    # Strip markdown code fences
+    text = response.strip()
+    text = text.replace("```json", "").replace("```", "").strip()
+
+    # Try to find a JSON object (handles text before/after the JSON)
+    import re as _re
+    json_match = _re.search(r'\{[^{}]+\}', text, _re.DOTALL)
+    if json_match:
+        try:
+            data = json.loads(json_match.group())
+            return FirewatchAction(**data)
+        except Exception:
+            pass
+
+    # Fallback: fetch_logs on first available service
+    fallback_service = services[0] if services else None
+    return FirewatchAction(action_type="fetch_logs", target_service=fallback_service)
+
+
+# ---------------------------------------------------------------------------
+# Observation summarizer — keeps prompt under 400 tokens
+# ---------------------------------------------------------------------------
+
+def summarize_observation(obs, history: list) -> str:
+    """
+    Summarize a SystemObservation into a compact string for LLM prompts.
+    Keeps output under ~400 tokens (~1600 chars).
+    """
+    if hasattr(obs, "services"):
+        services = obs.services
+        alerts = obs.active_alerts
+        sim_tick = obs.sim_tick
+        slo = obs.slo_budget_remaining_pct
+        bcm = obs.bad_customer_minutes
+    else:
+        services = obs.get("services", {})
+        alerts = obs.get("active_alerts", [])
+        sim_tick = obs.get("sim_tick", 0)
+        slo = obs.get("slo_budget_remaining_pct", 100.0)
+        bcm = obs.get("bad_customer_minutes", 0.0)
+
+    # Top 4 services by error rate
+    if isinstance(services, dict):
+        svc_items = services.items()
+    else:
+        svc_items = {}
+
+    ranked = sorted(
+        svc_items,
+        key=lambda x: (x[1].http_server_error_rate if hasattr(x[1], "http_server_error_rate")
+                       else x[1].get("http_server_error_rate", 0)),
+        reverse=True
+    )[:4]
+
+    svc_lines = []
+    for name, m in ranked:
+        if hasattr(m, "http_server_error_rate"):
+            err = m.http_server_error_rate
+            lat = m.http_server_request_duration_p99
+            mem = m.process_memory_utilization
+            status = m.status
+        else:
+            err = m.get("http_server_error_rate", 0)
+            lat = m.get("http_server_request_duration_p99", 0)
+            mem = m.get("process_memory_utilization", 0)
+            status = m.get("status", "unknown")
+        svc_lines.append(f"  {name}: err={err:.2f} lat={lat:.2f}s mem={mem:.2f} [{status}]")
+
+    # Top 3 alerts
+    alert_list = list(alerts)[:3]
+    alert_lines = []
+    for a in alert_list:
+        if hasattr(a, "alertname"):
+            name = a.alertname
+            svc = a.service_name
+            sev = a.severity
+            desc = (a.description or "")[:60]
+        else:
+            name = a.get("alertname", "?")
+            svc = a.get("service_name", "?")
+            sev = a.get("severity", "?")
+            desc = (a.get("description", ""))[:60]
+        alert_lines.append(f"  [{sev}] {name} on {svc}: {desc}")
+
+    # Last 3 history entries
+    hist_lines = []
+    for h in list(history)[-3:]:
+        if isinstance(h, dict):
+            atype = h.get("action_type", "?")
+            target = h.get("target_service", "")
+            fb = (h.get("feedback_string", ""))[:50]
+            hist_lines.append(f"  {atype}:{target} → {fb}")
+        else:
+            hist_lines.append(f"  {str(h)[:80]}")
+
+    parts = [
+        f"Tick:{sim_tick} SLO:{slo:.1f}% BCM:{bcm:.1f}",
+        "Services:",
+        "\n".join(svc_lines) if svc_lines else "  none",
+        "Alerts:",
+        "\n".join(alert_lines) if alert_lines else "  none",
+        "History:",
+        "\n".join(hist_lines) if hist_lines else "  none",
+    ]
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
