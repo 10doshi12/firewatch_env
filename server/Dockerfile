@@ -65,6 +65,9 @@ COPY --from=builder /app/env/.venv /app/.venv
 # Copy the environment code
 COPY --from=builder /app/env /app/env
 
+# Copy README to the path openenv-core expects in the container
+COPY --from=builder /app/env/README.md /app/README.md
+
 # Set PATH to use the virtual environment
 ENV PATH="/app/.venv/bin:$PATH"
 
