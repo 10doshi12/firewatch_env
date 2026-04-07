@@ -28,9 +28,13 @@ Usage:
     python -m server.app
 """
 
+import json
+
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
 
 try:
     from openenv.core.env_server.http_server import create_app
@@ -65,6 +69,71 @@ app = create_app(
     env_name="firewatch_env",
     max_concurrent_envs=1,  # increase this number to allow more concurrent WebSocket sessions
 )
+
+
+class StepInfoMiddleware(BaseHTTPMiddleware):
+    """
+    Middleware that injects an ``info`` dict into /step responses.
+
+    The openenv-core framework serializes SystemObservation by promoting
+    ``reward`` and ``done`` to the top level and dropping ``metadata``.
+    This middleware re-attaches the metadata as ``info`` so downstream
+    clients can read ``info["episode_score"]`` without digging into
+    ``observation``.
+
+    Only activates on POST /step responses with JSON content.
+    """
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        response = await call_next(request)
+
+        if request.url.path == "/step" and request.method == "POST":
+            try:
+                body_bytes = b""
+                async for chunk in response.body_iterator:
+                    body_bytes += chunk
+                data = json.loads(body_bytes)
+
+                obs = data.get("observation", {})
+                # Build info from observation fields that belong in metadata
+                info: dict = {}
+                if "episode_score" in obs and obs["episode_score"] is not None:
+                    info["episode_score"] = float(obs["episode_score"])
+                # Propagate any error info
+                if "error" in obs:
+                    info["error"] = obs["error"]
+
+                data["info"] = info
+
+                new_body = json.dumps(data).encode("utf-8")
+                # Build headers without content-length so Starlette sets it correctly
+                headers = {
+                    k: v for k, v in response.headers.items()
+                    if k.lower() != "content-length"
+                }
+                return Response(
+                    content=new_body,
+                    status_code=response.status_code,
+                    headers=headers,
+                    media_type="application/json",
+                )
+            except Exception:
+                # Never crash — return original response on any middleware error
+                headers = {
+                    k: v for k, v in response.headers.items()
+                    if k.lower() != "content-length"
+                }
+                return Response(
+                    content=body_bytes,
+                    status_code=response.status_code,
+                    headers=headers,
+                    media_type=response.media_type,
+                )
+
+        return response
+
+
+app.add_middleware(StepInfoMiddleware)
 
 
 # Zero-crash policy (CLAUDE.md): invalid requests must return HTTP 200 with error

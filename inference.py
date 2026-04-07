@@ -336,18 +336,22 @@ def find_root_cause(services: dict, dep_graph: dict) -> Optional[str]:
 
 def _pick_remediation(service_name: str, fetched_logs: dict) -> dict:
     """Pick remediation action based on log keywords for the service."""
-    logs = fetched_logs.get(service_name, [])
-    log_text = " ".join(logs).lower()
+    raw = fetched_logs.get(service_name, [])
+    # Accept both str (single log blob) and list of log lines
+    if isinstance(raw, str):
+        log_text = raw.lower()
+    else:
+        log_text = " ".join(raw).lower()
     if "oomkilled" in log_text or "exit code 137" in log_text or "memory limit" in log_text:
         return {"action_type": "restart_service", "target_service": service_name}
+    if "nullpointerexception" in log_text or "deploy" in log_text or "version" in log_text:
+        return {"action_type": "rollback_deploy", "target_service": service_name}
     if "hikaripool" in log_text or "connection pool" in log_text or "timed out after" in log_text:
         return {"action_type": "revert_config", "target_service": service_name}
     if "connection refused" in log_text or "circuit breaker" in log_text:
         return {"action_type": "circuit_break", "target_service": service_name}
     if "memory leak" in log_text or "high latency" in log_text:
         return {"action_type": "scale_replicas", "target_service": service_name}
-    if "nullpointerexception" in log_text or "deploy" in log_text or "version" in log_text:
-        return {"action_type": "rollback_deploy", "target_service": service_name}
     return {"action_type": "restart_service", "target_service": service_name}
 
 
