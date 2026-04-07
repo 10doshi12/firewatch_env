@@ -9,7 +9,8 @@ Environment Variables:
     API_BASE_URL  — LLM API endpoint (default: https://router.huggingface.co/v1)
     MODEL_NAME    — Model identifier (default: Qwen/Qwen2.5-7B-Instruct)
     HF_TOKEN      — HuggingFace API key (optional — rule-based runs without it)
-    SPACE_URL     — FirewatchEnv server URL (default: http://localhost:7860)
+    SPACE_URL     — Optional override for FirewatchEnv server URL.
+                    Auto-detected if not set: localhost:8000 → localhost:7860 → HF Space default.
 """
 
 import os
@@ -28,7 +29,6 @@ except ImportError:
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME   = os.getenv("MODEL_NAME",   "Qwen/Qwen2.5-7B-Instruct")
 API_KEY      = os.getenv("HF_TOKEN")
-SPACE_URL    = os.getenv("SPACE_URL",    "http://localhost:7860")
 DEFAULT_SPACE_URL = "https://10doshi12-firewatch-env.hf.space"
 
 
@@ -72,6 +72,9 @@ def resolve_server_url() -> str:
             continue
 
     return DEFAULT_SPACE_URL
+
+
+SPACE_URL    = resolve_server_url()
 
 
 MAX_STEPS              = 12     # hard cap — never more than 12 API calls per task
@@ -147,22 +150,14 @@ def log_end(success: bool, steps: int, score: float, rewards: list) -> None:
 # LLM response parser
 # ---------------------------------------------------------------------------
 
-def parse_llm_response(response: str, services: list) -> "FirewatchAction":
+def parse_llm_response(response: str, services: list) -> dict:
     """
-    Parse an LLM text response into a FirewatchAction.
+    Parse an LLM text response into an action dict.
 
     Tries JSON extraction first (handles markdown fences and embedded JSON).
     Falls back to fetch_logs on the first service in the services list if parsing fails.
-    Never raises.
+    Never raises. Returns a plain dict — no repo imports needed.
     """
-    try:
-        from models import FirewatchAction
-    except ImportError:
-        try:
-            from firewatch_env.models import FirewatchAction
-        except ImportError:
-            pass
-
     # Strip markdown code fences
     text = response.strip()
     text = text.replace("```json", "").replace("```", "").strip()
@@ -173,13 +168,14 @@ def parse_llm_response(response: str, services: list) -> "FirewatchAction":
     if json_match:
         try:
             data = json.loads(json_match.group())
-            return FirewatchAction(**data)
+            if "action_type" in data:
+                return data
         except Exception:
             pass
 
     # Fallback: fetch_logs on first available service
     fallback_service = services[0] if services else None
-    return FirewatchAction(action_type="fetch_logs", target_service=fallback_service)
+    return {"action_type": "fetch_logs", "target_service": fallback_service}
 
 
 # ---------------------------------------------------------------------------
