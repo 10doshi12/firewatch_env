@@ -114,9 +114,9 @@ SLO_BUDGET_INITIAL: float = 100.0
 
 # SLO burn rate per tick by difficulty. Higher = faster budget depletion.
 SLO_BURN_RATE_BY_DIFFICULTY: dict[str, float] = {
-    "easy": 1.5,
+    "easy": 3.0,
     "medium": 2.5,
-    "hard": 4.0,
+    "hard": 2.0,
 }
 
 # --- Degradation Speed (PRD §7.6) ---
