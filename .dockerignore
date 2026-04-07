@@ -10,6 +10,9 @@ __pycache__/
 inference.py
 client.py
 README.md
+readme.md
 *.md
-uv.lock
 openenv_firewatch_env.egg-info/
+.venv/
+*.log
+docs/
