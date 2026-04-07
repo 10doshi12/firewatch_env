@@ -32,7 +32,7 @@ try:
         ServiceMetrics,
         Alert,
     )
-    from ..simulation import ServiceMesh, generate_episode, FaultConfig
+    from ..simulation import ServiceMesh, generate_episode, FaultConfig, _count_blast_radius
     from ..actions import ActionHandler
     from ..rewards import RewardEngine, EpisodeResult, grade, build_info_dict
     from ..config import (
@@ -48,7 +48,7 @@ except ImportError:
         ServiceMetrics,
         Alert,
     )
-    from simulation import ServiceMesh, generate_episode, FaultConfig
+    from simulation import ServiceMesh, generate_episode, FaultConfig, _count_blast_radius
     from actions import ActionHandler
     from rewards import RewardEngine, EpisodeResult, grade, build_info_dict
     from config import (
@@ -298,6 +298,11 @@ class FirewatchEnvironment(Environment):
                 services_affected=len(affected),
                 _affected_services=affected,
             )
+            # Set static episode-level counts for grade() (Fix 1 + Fix 3)
+            self._episode_result.services_affected_static = _count_blast_radius(
+                self._mesh, self._fault_config
+            )
+            self._episode_result.total_services_in_episode = len(self._mesh.services)
             self._action_history = []
             self._episode_done = False
 

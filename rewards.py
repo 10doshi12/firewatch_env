@@ -13,42 +13,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-try:
-    from .models import SystemObservation, FirewatchAction
-    from .config import (
-        REWARD_WEIGHT_HEALTH,
-        REWARD_WEIGHT_SLO,
-        REWARD_MTTM_BONUS,
-        REWARD_TIME_COST,
-        REWARD_WRONG_ACTION_PENALTY,
-        REWARD_SLO_BREACH_PENALTY,
-        GRADER_WEIGHT_RECOVERY,
-        GRADER_WEIGHT_SPEED,
-        GRADER_WEIGHT_PRECISION,
-        GRADER_WEIGHT_SLO,
-        GRADER_WRONG_ACTION_PENALTY_PER_ACTION,
-        GRADER_SPEED_MTTM_WEIGHT,
-        GRADER_SPEED_BCM_WEIGHT,
-        TASKS,
-    )
-except ImportError:
-    from models import SystemObservation, FirewatchAction
-    from config import (
-        REWARD_WEIGHT_HEALTH,
-        REWARD_WEIGHT_SLO,
-        REWARD_MTTM_BONUS,
-        REWARD_TIME_COST,
-        REWARD_WRONG_ACTION_PENALTY,
-        REWARD_SLO_BREACH_PENALTY,
-        GRADER_WEIGHT_RECOVERY,
-        GRADER_WEIGHT_SPEED,
-        GRADER_WEIGHT_PRECISION,
-        GRADER_WEIGHT_SLO,
-        GRADER_WRONG_ACTION_PENALTY_PER_ACTION,
-        GRADER_SPEED_MTTM_WEIGHT,
-        GRADER_SPEED_BCM_WEIGHT,
-        TASKS,
-    )
+from firewatch_env.models import SystemObservation, FirewatchAction
+from firewatch_env.config import (
+    REWARD_WEIGHT_HEALTH,
+    REWARD_WEIGHT_SLO,
+    REWARD_MTTM_BONUS,
+    REWARD_TIME_COST,
+    REWARD_WRONG_ACTION_PENALTY,
+    REWARD_SLO_BREACH_PENALTY,
+    GRADER_WEIGHT_RECOVERY,
+    GRADER_WEIGHT_SPEED,
+    GRADER_WEIGHT_PRECISION,
+    GRADER_WEIGHT_SLO,
+    GRADER_WRONG_ACTION_PENALTY_PER_ACTION,
+    GRADER_SPEED_MTTM_WEIGHT,
+    GRADER_SPEED_BCM_WEIGHT,
+    TASKS,
+)
 
 
 # ==========================================================================
