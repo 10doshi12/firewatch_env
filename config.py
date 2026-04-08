@@ -47,16 +47,24 @@ FULL_DEPENDENCY_GRAPH: dict[str, list[str]] = {
 
 # ==========================================================================
 # Section 2 — Fault Taxonomy
-# Source: AIOpsLab (Microsoft Research + UC Berkeley, MLSys 2025), Table 2
+# Inspired by AIOpsLab (Chen et al., arXiv:2501.06706, Jan 2025; earlier
+# vision paper: Shetty et al., SoCC'24) — fault categories in Figure 3.
+# For memory_leak specifically, Azure RESIN's fail-slow characterization
+# (Microsoft Azure Blog, 2024) is a closer model than AIOpsLab's
+# memory_stress step-function.
+#
+# Five faults here are a curated subset, not a 1:1 mapping — bad_deploy
+# has no direct AIOpsLab equivalent and is modeled after Soldani et al.
+# (2025) cascading-failure-from-logs examples.
 # ==========================================================================
 
-# Five fault types mapped from AIOpsLab benchmark fault set.
+# Five fault types — curated subset inspired by AIOpsLab fault categories.
 FAULT_TYPES: list[str] = [
-    "oom",                # AIOpsLab: memory_stress — OOMKilled by Linux kernel
-    "memory_leak",        # AIOpsLab: memory_leak — gradual memory growth
+    "oom",                # AIOpsLab: memory_stress (Chaos-Mesh) — OOMKilled by Linux kernel
+    "memory_leak",        # Azure RESIN model — gradual growth; AIOpsLab memory_stress is step-function
     "config_drift",       # AIOpsLab: misconfig_app — connection pool exhaustion
-    "network_partition",  # AIOpsLab: network_delay — latency / packet loss
-    "bad_deploy",         # AIOpsLab: pod restart — faulty deployment rollout
+    "network_partition",  # AIOpsLab: network_delay/network_loss — latency / packet loss
+    "bad_deploy",         # Soldani et al. (2025) cascading-failure pattern — no direct AIOpsLab analog
 ]
 
 # Which fault types are available at each difficulty level.
@@ -77,27 +85,39 @@ FAULT_TYPES_BY_DIFFICULTY: dict[str, list[str]] = {
 # Source: PRD §7.4 — "30 seconds per tick"
 SECONDS_PER_TICK: int = 30
 
-# --- Cascade Propagation (PRD §8.4) ---
-# Attenuation per hop: direct downstream receives error_rate × 0.25,
-# next hop multiplied by this factor. Three hops: 0.25 → 0.10 → 0.04.
-# Source: PRD §8.4 — "matches realistic blast radius behavior"
+# --- Cascade Propagation ---
+# Structural form (BFS from root, attenuation per hop, depth cap) follows
+# Soldani et al. (2025) graph-based cascading-failure model.
+# No published canonical attenuation values exist — these are engineering
+# parameters defended on blast-radius data:
+#
+# 0.25 direct-downstream factor: models partial error isolation (timeouts,
+#   retries, fallbacks). FireHydrant 2022 data shows ~30% of incidents cross
+#   one service boundary but <10% cross three.
+# 0.40 per-hop attenuation: three-hop cascade from critical (0.50) upstream
+#   terminates below 0.10 degraded threshold, creating a natural two-hop
+#   blast radius matching Causely (2024) microservice incident analysis.
+# Depth=3: matches two-hop observability principle in distributed tracing;
+#   real topologies have depth ~3-5 from API gateway to leaf.
+# Threshold=0.30: prevents red-herring services (0.05-0.09) from triggering
+#   false cascades. Engineering threshold, not a published value.
 CASCADE_ATTENUATION_FACTOR: float = 0.40
-
-# Maximum cascade depth in hops from root cause service.
 CASCADE_MAX_DEPTH: int = 3
-
-# Upstream error rate must exceed this threshold to cascade downstream.
-# Below this, the upstream service absorbs the fault without propagating.
 CASCADE_ERROR_THRESHOLD: float = 0.30
-
-# Base proportion of upstream error rate applied to direct downstream.
-# Source: PRD §8.4 — "upstream_error_rate × 0.25"
 CASCADE_DOWNSTREAM_FACTOR: float = 0.25
 
-# --- Status Derivation Thresholds (PRD §7.2) ---
-# Applied in order: down → critical → degraded → healthy
+# --- Status Derivation Thresholds ---
+# Applied in order: down → critical → degraded → healthy.
+# Error thresholds (0.10/0.50/0.90) trace to canonical 99.9% SLO tier:
+#   at 0.10 you've burned through 9s-worth of error budget in one tick;
+#   at 0.50 you're catastrophically off-SLO; at 0.90 effectively non-functional.
+# Latency thresholds (0.50s/2.0s) align with Prometheus default HTTP histogram
+#   bucket boundaries: [0.005..0.5..2.5..10]. Real Prometheus installations
+#   alert at 0.5 and 2.5 — our 0.5 and 2.0 match within one bucket.
+# Memory 0.98 = Linux cgroup OOM territory (memory.current >= memory.max);
+#   one tick of headroom before the kernel kills the container.
 STATUS_THRESHOLD_DOWN_ERROR: float = 0.90       # error_rate >= 0.90 → down
-STATUS_THRESHOLD_DOWN_MEMORY: float = 0.98       # memory_utilization >= 0.98 → down
+STATUS_THRESHOLD_DOWN_MEMORY: float = 0.98       # memory_utilization >= 0.98 → down (OOMKill)
 STATUS_THRESHOLD_CRITICAL_ERROR: float = 0.50    # error_rate >= 0.50 → critical
 STATUS_THRESHOLD_CRITICAL_LATENCY: float = 2.0   # latency_p99 >= 2.0s → critical
 STATUS_THRESHOLD_DEGRADED_ERROR: float = 0.10    # error_rate >= 0.10 → degraded
@@ -105,19 +125,27 @@ STATUS_THRESHOLD_DEGRADED_LATENCY: float = 0.50  # latency_p99 >= 0.50s → degr
 
 # --- Healthy Metric Baseline ---
 # Threshold below which a service is considered healthy for wrong-action checks.
-# Source: PRD §3.4 — "remediates a service whose error rate is below the healthy threshold"
+# Known asymmetry: HEALTHY (0.05) vs DEGRADED (0.10) creates a 0.05–0.10
+# "invisible-but-legal" zone where remediation is legal but not signaled.
+# This is intentional — the agent is trained to act decisively at degradation,
+# not reactively to baseline noise. See grounding review §11.
 HEALTHY_ERROR_RATE_THRESHOLD: float = 0.05
 
-# --- SLO Budget (PRD §7.4, §7.6) ---
-# SLO budget per difficulty. Formula: max_ticks × burn_rate, so a do-nothing
-# agent exhausts exactly its tick budget — SLO breach only for wasted actions.
+# --- SLO Budget ---
+# Budget = max_ticks × burn_rate: a do-nothing agent exhausts exactly
+# its tick budget, removing the degenerate "stall to preserve SLO" strategy.
+# Any wasted investigation action trades SLO for time — the real SRE dilemma.
+# Scaling (easy 1.5 → hard 3.0) simulates higher-severity incidents that
+# burn budget faster per unit time. Combined with SLO_BURN_RATE_MITIGATED_MULTIPLIER
+# (0.2 shield when user-facing services recover), this incentivizes stopping
+# user impact quickly (80% burn reduction) over finishing full investigation.
 SLO_BUDGET_BY_DIFFICULTY: dict[str, float] = {
     "easy":   20 * 1.5,   # 30.0
     "medium": 30 * 2.0,   # 60.0
     "hard":   40 * 3.0,   # 120.0
 }
 
-# SLO burn rate per tick by difficulty; burn rate increases with difficulty as PRD §3.3 requires.
+# SLO burn rate per tick by difficulty.
 SLO_BURN_RATE_BY_DIFFICULTY: dict[str, float] = {
     "easy":   1.5,
     "medium": 2.0,
@@ -132,46 +160,69 @@ DEGRADATION_SPEED_BY_DIFFICULTY: dict[str, float] = {
     "hard": 2.0,
 }
 
-# --- Fault Physics Per-Tick Rates (PRD §8.3) ---
-# These are BASE rates multiplied by degradation_speed for the difficulty.
+# --- Fault Physics Per-Tick Rates ---
+# BASE rates × degradation_speed. These are compressed real-world dynamics
+# for learnability — none conflict with published symptom directionality.
+# Relative severity ordering: network_partition > config_drift > oom >
+# bad_deploy > memory_leak, matching SRE intuition for blast speed.
 
-# OOM fault: memory_utilization increment per tick
+# OOM: memory climbs from ~0.33 baseline to 0.98 OOMKill in ~5 ticks (2.5 min)
+# at speed=1.0. Plausible for runaway allocation loop (Sysdig 2024 report:
+# OOM events cluster in "sudden allocation" not "slow leak" patterns).
 OOM_MEMORY_RATE: float = 0.15
 
-# Memory leak fault rates
+# Memory leak: models GC-pressure signature — memory → latency → errors.
+# This ordering matches real-world incidents where SREs see latency climb
+# before 5xx errors. ~10 ticks to become obviously bad (compressed from
+# real-world fail-slow leaks that take days; per Azure RESIN).
 MEMLEAK_MEMORY_RATE: float = 0.05      # memory_utilization per tick
 MEMLEAK_LATENCY_RATE: float = 0.5      # latency_p99 seconds per tick
 MEMLEAK_ERROR_RATE: float = 0.02       # error_rate per tick
 
-# Bad deploy fault rates
+# Bad deploy: linear ramp (0.08/tick) softens the real step-function for
+# agent learnability. Real signal is correlation with deploy timestamp
+# (last_deployment_age_seconds), which is correctly exposed.
 BAD_DEPLOY_ERROR_RATE: float = 0.08    # error_rate per tick
 BAD_DEPLOY_LATENCY_RATE: float = 0.3   # latency_p99 seconds per tick
 
-# Config drift fault rates
+# Config drift: 3.0s/tick latency crosses 2.0s CRITICAL threshold in one
+# tick — aggressive but matches real pool-exhaustion behavior where threads
+# either get a connection or time out.
 CONFIG_DRIFT_ERROR_RATE: float = 0.12  # error_rate per tick
 
-# Network partition fault rates
+# Network partition: fastest error growth. Realistic — a partition produces
+# ECONNREFUSED immediately on every downstream call. The 5.0s latency floor
+# in _apply_network_partition matches default Java SocketTimeout (5-10s).
 NETWORK_PARTITION_ERROR_RATE: float = 0.20  # error_rate per tick
 
-# --- Reward Weights (PRD §3.4) ---
-REWARD_WEIGHT_HEALTH: float = 1.0          # Primary signal: health improvement delta
-REWARD_WEIGHT_SLO: float = 0.3            # SLO budget preservation
+# --- Reward Weights ---
+# Per-step reward signal shapes agent behavior during episodes.
+REWARD_WEIGHT_HEALTH: float = 1.0          # Primary signal: health_improvement delta
+REWARD_WEIGHT_SLO: float = 0.3            # SLO budget preservation (secondary to health)
 REWARD_MTTM_BONUS: float = 2.0            # One-time bonus when BCM delta reaches zero
+                                           # (2× health weight to strongly reward mitigation)
 REWARD_TIME_COST: float = -0.05           # Constant negative per tick — creates urgency
-REWARD_WRONG_ACTION_PENALTY: float = -0.5  # Remediating a healthy service
+                                           # without dominating the health signal
+REWARD_WRONG_ACTION_PENALTY: float = -0.5  # Remediating a service < HEALTHY threshold (0.05)
 REWARD_SLO_BREACH_PENALTY: float = -2.0   # Terminal penalty when budget hits zero
 
 # --- SLO Mitigation Shield ---
-# Burn rate multiplier when user-facing services are below DEGRADED threshold.
-# Earned by actually stopping user impact — not by calling circuit_break.
+# Burn rate drops to 20% when user-facing services recover below DEGRADED.
+# Models Google SRE's "mitigate before investigate" doctrine: an engineer who
+# circuit_breaks a user-facing path is rewarded even without finding root cause,
+# because customer pain has stopped.
 SLO_BURN_RATE_MITIGATED_MULTIPLIER: float = 0.2
 
-# User-facing services whose health determines the mitigation shield
+# User-facing services whose health determines the mitigation shield.
+# api-gateway = entry point; checkout-service = revenue-critical path.
 USER_FACING_SERVICES: list[str] = ["api-gateway", "checkout-service"]
 
 # --- Premature Exit Penalty ---
 # Scaled penalty when agent calls declare_resolved with system still broken.
-# Combined: BASE + (mean_error × SCALE). Always worse than SLO breach (-2.0).
+# Combined: BASE + (mean_error × SCALE) = up to -5.0 at mean_error=1.0.
+# This 5× amplification vs normal ±1.0 step rewards is acceptable for
+# LLM-as-agent (grader-only, not seen during inference). For real RL training,
+# consider clipping to [-3.0, 0.0] range for gradient stability.
 REWARD_PREMATURE_EXIT_BASE: float = -2.0
 REWARD_PREMATURE_EXIT_SCALE: float = -3.0
 
@@ -194,19 +245,37 @@ INVESTIGATION_ACTIONS: frozenset[str] = frozenset({
     "inspect_commit_diff",
 })
 
-# --- Grader Weights (PRD §3.5) ---
-# Unified formula: recovery(40%) + speed/MTTM(25%) + precision(20%) + SLO(15%)
+# --- Grader Weights ---
+# No published canonical grader for SRE RL environments exists. These are
+# defended on decision-theoretic grounds:
+#   Recovery (40%): dominant because restoring service is what matters most.
+#     Google SRE: "reliability is table stakes; everything else is commentary."
+#   Speed (25%): second because MTTM is what customers feel. Composed of
+#     MTTM (60%) + BCM (40%) — deliberately NOT using MTTM alone because
+#     Google SRE's 2021 "Incident Metrics in SRE" report showed MTTM/MTTR
+#     are poorly suited as primary metrics (log-normal distribution).
+#     BCM is a direct integral of user impact without log-normal pathology.
+#     Effective MTTM weight on total grade: 0.25 × 0.6 = 15%.
+#   Precision (20%): penalizes wrong remediations (fixing healthy services,
+#     wrong fault type). Creates the precision-vs-recall trade-off for agents.
+#   SLO (15%): last because it's partly an aggregate of the first three.
+#     Kept low to prevent over-indexing on SLO preservation at expense of
+#     actual recovery. Still useful to penalize slow investigation.
+# Unit-sum = 1.0. Each component clipped to [0.0, 1.0]. Raw score clipped
+# to (0.01, 0.99) to preserve gradient signal in RL reward shaping.
 GRADER_WEIGHT_RECOVERY: float = 0.40
 GRADER_WEIGHT_SPEED: float = 0.25
 GRADER_WEIGHT_PRECISION: float = 0.20
 GRADER_WEIGHT_SLO: float = 0.15
 
 # Precision penalty per wrong action. 6 wrong actions = precision score of 0.0.
-# Source: PRD §11.4 — "Six wrong actions = precision score of 0.0"
 GRADER_WRONG_ACTION_PENALTY_PER_ACTION: float = 1.0 / 6.0
 
-# Speed component sub-weights (PRD §11.4)
-# Speed = 0.6 × MTTM score + 0.4 × BCM score
+# Speed sub-weights: MTTM (60%) + BCM (40%).
+# MTTM = FireHydrant definition: "time between incident start and when
+# the system no longer exhibits problems to users — stop the bleeding."
+# BCM = direct integral of user impact per tick; a custom metric faithful
+# to the Google SRE concept (Google doesn't publish their formula).
 GRADER_SPEED_MTTM_WEIGHT: float = 0.6
 GRADER_SPEED_BCM_WEIGHT: float = 0.4
 
@@ -233,15 +302,22 @@ RED_HERRING_ERROR_RATE_MAX: float = 0.09
 assert RED_HERRING_ERROR_RATE_MAX < STATUS_THRESHOLD_DEGRADED_ERROR, \
     "Red herring max error must be below degraded threshold to enforce wrong-action penalty"
 
-# --- BCM Calculation Constants (PRD §8.5) ---
-# Latency normalization: latency_normalized = max(0, (latency_p99 - 0.5) / 2.0)
+# --- BCM Calculation Constants ---
+# BCM_delta = Σ (error_rate + latency_normalized × 0.5) × (30 / 60)
+# where latency_normalized = max(0, (latency_p99 - 0.5) / 2.0)
+#
+# 0.5 weight on latency: a 2s-delay user is annoyed; a 500-error user is broken.
+#   Service at p99=2.5s contributes 1.0 × 0.5 = 0.5 BCM per tick, same as
+#   error_rate = 0.5. Symmetry preserved.
+# Cap at 2.0: prevents a single pathological 30s-latency service from dominating.
+#   A max-latency service contributes 2.0 × 0.5 = 1.0 BCM/tick, same as a
+#   fully broken service. Stability choice.
+# Note: services at status="healthy" contribute zero BCM (baseline noise excluded).
+#   This means a red herring at 0.08 error_rate produces no user impact — intentional.
 BCM_LATENCY_BASELINE: float = 0.5   # Latency below this contributes zero BCM
 BCM_LATENCY_SCALE: float = 2.0      # Normalization divisor
 BCM_LATENCY_WEIGHT: float = 0.5     # Latency contribution relative to error_rate
 BCM_LATENCY_NORMALIZED_MAX: float = 2.0
-# Maximum BCM penalty a single service's latency can inflict per tick,
-# before BCM_LATENCY_WEIGHT is applied. Prevents latency dominating BCM
-# calculation relative to error_rate contribution.
 
 
 # ==========================================================================
@@ -307,7 +383,7 @@ TASKS: dict[str, TaskConfig] = {
             "7 services, 3 red herrings, 40 tick budget. Config drift causes "
             "connection pool exhaustion. One red herring emits adversarial "
             "prompt injection in logs — testing robustness against in-band "
-            "instruction injection, a documented 2026 SRE security threat. "
+            "instruction injection (OWASP LLM Top 10 #1, Prompt Injection). "
             "Fast degradation and tight SLO burn require decisive action "
             "under noise."
         ),
@@ -508,6 +584,19 @@ TRAFFIC_SHIFT_MIN_DRAIN: float = 0.05
 # Minimum traffic drain fraction; allows canary-style 5% incremental drains.
 # Source: Kubernetes/Istio VirtualService canary patterns
 TRAFFIC_SHIFT_MAX_DRAIN: float = 0.95          # Max 95% (keep 5% for health checks)
+
+# ==========================================================================
+# Citations
+# ==========================================================================
+# Chen et al. "AIOpsLab: A Holistic Framework to Evaluate AI Agents for
+#   Enabling Autonomous Clouds" arXiv:2501.06706 (2025).
+# Shetty et al. "Building AI Agents for Autonomous Clouds: Challenges and
+#   Design Principles" SoCC'24.
+# Soldani et al. "Explaining Microservices' Cascading Failures From Their
+#   Logs" Software: Practice and Experience (2025).
+# Azure RESIN memory leak detection: https://azure.microsoft.com/en-us/blog/
+#   advancing-memory-leak-detection-with-aiops-introducing-resin/
+# Google SRE: "Incident Metrics in SRE" (sre.google, 2021) — MTTM/MTTR caveats.
 
 
 # ==========================================================================

@@ -77,10 +77,13 @@ def resolve_server_url() -> str:
 SPACE_URL    = resolve_server_url()
 
 
-MAX_STEPS              = 20     # hard cap — never more than 12 API calls per task
-SUCCESS_SCORE_THRESHOLD = 0.1
-TEMPERATURE            = 0.3   # low temperature for decisive action selection
-MAX_TOKENS             = 256   # just enough for one JSON action object
+MAX_STEPS              = 20     # hard cap — never more than 20 steps per task
+SUCCESS_SCORE_THRESHOLD = 0.1   # any recovery above 10% counts as success
+                                # (grader clips raw score to (0.01, 0.99) exclusive)
+TEMPERATURE            = 0.3   # low temperature for decisive action — SRE agents
+                                # should be deterministic, not creative
+MAX_TOKENS             = 256   # constrains output to one JSON action object;
+                                # prevents the LLM from generating explanations
 
 
 # ---------------------------------------------------------------------------
@@ -358,8 +361,12 @@ def find_root_cause(services: dict, dep_graph: dict) -> Optional[str]:
     """
     Identify root cause using dependency topology + error rates.
 
-    Scores each degraded service: base = error_rate.
-    +0.5 bonus for each other degraded service that depends on it (upstream cause).
+    Scores each degraded service (error_rate >= 0.10, matching
+    STATUS_THRESHOLD_DEGRADED_ERROR): base = error_rate.
+    +0.5 bonus for each other degraded service that depends on it
+    (upstream cause indicator). This topology bonus captures the
+    "cause ≠ effect" principle — the upstream root cause often has
+    a lower error rate than its downstream victims.
     """
     if not services:
         return None
@@ -494,6 +501,10 @@ def rule_based_action(obs: dict, step: int, state: dict) -> dict:
 
 def _recovery_hint(obs: dict, history: list) -> str:
     """Generate a decision hint based on current system state and history.
+
+    Uses 0.10 threshold (STATUS_THRESHOLD_DEGRADED_ERROR) to distinguish
+    genuinely fault-affected services from baseline noise/red herrings
+    (which sit at 0.05-0.09 permanently and don't need fixing).
 
     Key design: the 'all healthy — declare NOW' hint only fires AFTER a
     remediation action has been applied.  Early-stage faults may have

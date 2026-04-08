@@ -65,13 +65,19 @@ class RewardEngine:
     """
     Computes per-step rewards from observable system outcomes.
 
-    Six reward components:
-      1. Health improvement — positive when mean error rate decreases
-      2. SLO preservation — tracks budget depletion rate
-      3. MTTM bonus — one-time reward when BCM delta hits zero
-      4. Time cost — constant negative per step (urgency signal)
-      5. Wrong action penalty — remediating a healthy service
-      6. SLO breach penalty — terminal when budget exhausted
+    Six reward components, each with a distinct behavioral incentive:
+      1. Health improvement (1.0) — primary signal: mean error rate decrease
+         weighted by dependency topology (upstream services count more)
+      2. SLO preservation (0.3) — secondary: tracks budget depletion rate.
+         Lower weight than health to prevent SLO-gaming over actual recovery.
+      3. MTTM bonus (2.0) — one-time reward when BCM delta hits zero.
+         2× health weight to strongly reward the "stop the bleeding" moment
+         (per Google SRE's "mitigate before investigate" doctrine).
+      4. Time cost (-0.05) — constant negative per step. Creates urgency
+         without dominating the health signal.
+      5. Wrong action penalty (-0.5) — remediating a service below
+         HEALTHY_ERROR_RATE_THRESHOLD (0.05). Enforces precision.
+      6. SLO breach penalty (-2.0) — terminal when budget exhausted.
     """
 
     def __init__(self) -> None:
@@ -245,19 +251,30 @@ def grade(episode_result: EpisodeResult, difficulty: str) -> float:
     """
     Compute final episode score using unified 4-component formula.
 
-    Components (weights from config.py):
-      - Recovery (40%): services_recovered / services_affected
-      - Speed (25%): composite of MTTM and BCM scores
-      - Precision (20%): penalized by wrong actions
-      - SLO (15%): final budget remaining
+    Components (weights from config.py, defended on decision-theoretic grounds):
+      - Recovery (40%): services_recovered / services_affected.
+        Dominant because restoring service is the single most important outcome.
+        Google SRE: "reliability is table stakes."
+      - Speed (25%): composite of MTTM (60%) + BCM (40%).
+        Uses MTTM as one of two sub-components, NOT as a primary metric,
+        because Google SRE's 2021 "Incident Metrics in SRE" report
+        demonstrated log-normal distribution makes MTTM means misleading.
+        BCM (direct impact integral) compensates for this pathology.
+        Effective MTTM weight on total grade: 0.25 × 0.6 = 15%.
+      - Precision (20%): 1 - (wrong_actions / 6). Penalizes remediating
+        healthy services or applying wrong fault-type fixes.
+      - SLO (15%): final_budget / initial_budget. Last because it's partly
+        an aggregate of the first three — kept low to prevent over-indexing.
+
+    Score clipped to (0.01, 0.99) exclusive to preserve gradient signal
+    in RL reward shaping (prevents identity-free perfect/total-failure scores).
 
     Args:
         episode_result: Completed episode statistics.
         difficulty: "easy", "medium", or "hard" — for max_ticks lookup.
 
     Returns:
-        Float in the open interval (0.0, 1.0) — exclusive of both endpoints.
-        Rounded to 2 decimal places. Minimum 0.01, maximum 0.99.
+        Float in (0.01, 0.99). Rounded to 2 decimal places.
     """
     er = episode_result
     task_key = f"task_{difficulty}"
@@ -334,6 +351,11 @@ def compute_premature_exit_penalty(obs: SystemObservation, tick_count: int, mttm
     At mean_error=1.0: -2.0 + (-3.0) = -5.0
     At mean_error=0.10: -2.0 + (-0.30) = -2.30
     At mean_error <= 0.05: 0.0 (no penalty)
+
+    NOTE: The -5.0 maximum is 5× normal step rewards (±1.0). This
+    asymmetry is acceptable for LLM-as-agent (grader-only, agent never
+    sees reward during inference). For real RL training, clip to [-3.0, 0.0]
+    for gradient stability.
 
     Returns:
         Float penalty (negative or zero).
@@ -545,11 +567,17 @@ def _weighted_mean_error_rate(services: dict, dependency_graph: dict) -> float:
     """
     Compute mean error rate across services, weighted by downstream dependent count.
 
+    Topology-weighted rather than flat average: upstream services (e.g., db-proxy)
+    that many services depend on are weighted higher because their failure has
+    a larger customer blast radius. This aligns the reward signal with the
+    real-world SRE principle that upstream root causes matter more than
+    downstream symptoms.
+
     Weight formula: weight(svc) = 1 + count(other services that list svc as a dependency)
-    Example: api-gateway with 3 dependents → weight=4; cache leaf → weight=1.
+    Example: db-proxy (depended on by auth, user, payment) → weight=4; cache leaf → weight=1.
 
     Args:
-        services: Dict mapping service_name → ServiceMetrics (must have http_server_error_rate).
+        services: Dict mapping service_name → ServiceMetrics.
         dependency_graph: Dict mapping service_name → list[dependency_name].
 
     Returns:

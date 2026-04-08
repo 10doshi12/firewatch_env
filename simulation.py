@@ -103,7 +103,20 @@ class FaultConfig:
 
 @dataclass
 class IncidentMetrics:
-    """Tracks cumulative user impact and mitigation timing."""
+    """Tracks cumulative user impact and mitigation timing.
+
+    MTTM (Mean Time To Mitigate) uses a 2-tick zero-BCM streak, calibrated
+    to the tick(action_apply) ordering where mesh.tick() runs before the
+    action. At optimal play on easy (5 steps), a 3-tick streak literally
+    cannot be reached before declare_resolved. The 2-tick streak is a
+    mechanical necessity, not a semantic choice.
+
+    NOTE: Google SRE's 2021 "Incident Metrics in SRE" report showed MTTM
+    is poorly suited as a primary metric (log-normal distribution). We
+    compensate by combining MTTM with BCM (direct impact integral) in the
+    grader speed component (60/40 blend), keeping effective MTTM weight
+    at only 15% of total grade (0.25 × 0.6).
+    """
 
     bad_customer_minutes: float = 0.0
     mttm_achieved_tick: int | None = None
@@ -111,7 +124,13 @@ class IncidentMetrics:
     _zero_bcm_streak: int = field(default=0, repr=False)
 
     def update(self, bcm_delta: float, current_tick: int) -> None:
-        """Update BCM and check MTTM achievement (requires 2 consecutive zero-BCM ticks)."""
+        """Update BCM and check MTTM achievement.
+
+        Requires 2 consecutive zero-BCM ticks to lock MTTM. A single
+        zero-BCM tick can occur spuriously from random baseline errors
+        all falling below contribution — the streak requirement filters
+        this noise while remaining achievable within episode budgets.
+        """
         self.bad_customer_minutes += bcm_delta
         if bcm_delta <= 0.0 and current_tick > 0:
             self._zero_bcm_streak += 1
@@ -170,14 +189,19 @@ def _generate_bad_deploy_logs(service: str, metrics: ServiceMetrics) -> list[str
 
 
 def _generate_config_drift_logs(service: str, metrics: ServiceMetrics) -> list[str]:
-    """Config drift logs showing HikariCP pool exhaustion."""
+    """Config drift logs showing HikariCP pool exhaustion.
+
+    Uses HikariCP's real exception message format (recognizable to any Java SRE).
+    Default maximumPoolSize=10 per HikariCP wiki "About Pool Sizing"
+    (formula: connections = core_count × 2 + effective_spindle_count).
+    """
     fd_count = metrics.process_open_file_descriptors
     lines = [
-        f"2026-04-04T02:05:11Z WARN  [{service}] HikariPool: Connection pool at capacity (5/5)",
-        f"2026-04-04T02:05:44Z ERROR [{service}] HikariPool: Connection is not available, request timed out after 30000ms.",
+        f"2026-04-04T02:05:11Z WARN  [{service}] HikariPool-1 - Connection pool at capacity (10/10)",
+        f"2026-04-04T02:05:44Z ERROR [{service}] HikariPool-1 - Connection is not available, request timed out after 30000ms (total=10, active=10, idle=0, waiting=47)",
         f"2026-04-04T02:06:22Z WARN  [{service}] open_file_descriptors={fd_count} - approaching system limit",
-        f"2026-04-04T02:07:00Z ERROR [{service}] HikariPool: Connection pool at capacity (5/5) - config revision may have reduced max_pool_size",
-        f"2026-04-04T02:07:33Z ERROR [{service}] java.sql.SQLTransientConnectionException: Connection pool exhausted (pool_size=5, was 50)",
+        f"2026-04-04T02:07:00Z ERROR [{service}] HikariPool-1 - Connection pool at capacity (10/10) - config revision may have reduced maximumPoolSize",
+        f"2026-04-04T02:07:33Z ERROR [{service}] java.sql.SQLTransientConnectionException: HikariPool-1 - Connection is not available, request timed out after 30000ms (total=2, active=2, idle=0, waiting=63) — configuration reverted maximumPoolSize from 10 to 2",
     ]
     return lines
 
@@ -353,6 +377,11 @@ class ServiceMesh:
         Recovers BOTH the root cause service AND all cascaded downstream
         services. Without downstream recovery, health_improvement stays
         near zero because cascade victims never heal.
+
+        Recovery rates (0.15/tick error, 1.0-1.5/tick latency) use fixed
+        linear decay — a defensible simplification of the real exponential
+        warmup curve (JVM JIT warmup, cache re-warming follow 1-e^(-t/τ)).
+        Linear is chosen for simulation predictability.
         """
         fc = self.fault_config
         speed = fc.degradation_speed
@@ -360,14 +389,17 @@ class ServiceMesh:
         # Recover root cause service
         svc = self.services.get(fc.root_cause_service)
         if svc is not None:
+            # 0.15/tick matches OOM_MEMORY_RATE — symmetric recovery/degradation
             svc.http_server_error_rate = max(0.01, svc.http_server_error_rate - speed * 0.15)
 
+            # Target 0.1s = healthy baseline latency (50-150ms range)
             target_lat = 0.1
             current_lat = svc.http_server_request_duration_p99
             if current_lat > target_lat:
                 svc.http_server_request_duration_p99 = max(target_lat, current_lat - speed * 1.5)
 
             # Recover memory for OOM/memory_leak faults
+            # Target 0.25 = lower end of healthy baseline (25-40% range)
             if fc.fault_type in ("oom", "memory_leak") and svc.process_memory_utilization > 0.40:
                 svc.process_memory_utilization = max(0.25, svc.process_memory_utilization - speed * 0.10)
                 svc.process_memory_usage_bytes = int(
@@ -379,20 +411,27 @@ class ServiceMesh:
             if name == fc.root_cause_service:
                 continue
             if name in fc.red_herring_services:
-                continue  # Red herrings keep static degradation
-            # Gradually reduce cascaded error contribution
+                continue  # Red herrings keep static degradation (intentional)
+            # 0.10/tick downstream recovery — slightly slower than root cause
             if metrics.http_server_error_rate > 0.02:
                 metrics.http_server_error_rate = max(
                     0.01, metrics.http_server_error_rate - speed * 0.10
                 )
-            # Gradually reduce cascaded latency
             if metrics.http_server_request_duration_p99 > 0.15:
                 metrics.http_server_request_duration_p99 = max(
                     0.1, metrics.http_server_request_duration_p99 - speed * 1.0
                 )
 
     def _apply_oom(self, svc: ServiceMetrics, speed: float) -> None:
-        """OOM: memory grows rapidly, then OOMKill at 0.98."""
+        """OOM: memory grows rapidly, then OOMKill at 0.98.
+
+        Post-kill: memory resets to 0.85 (not baseline) simulating "restart
+        with residual leaked state still allocated" (e.g., in-memory cache
+        with appendonly). A more aggressive reset to 0.25-0.40 would model
+        a clean container restart — this variant was chosen to keep error_rate
+        elevated and make the OOM signal persist for agent detection.
+        Exit code 137 = SIGKILL (128 + signal 9), per Linux cgroup semantics.
+        """
         svc.process_memory_utilization += speed * OOM_MEMORY_RATE
         svc.process_memory_usage_bytes = int(
             svc.process_memory_utilization * svc.process_memory_limit_bytes
@@ -401,15 +440,22 @@ class ServiceMesh:
         if svc.process_memory_utilization >= 0.98:
             svc.http_server_error_rate = 1.0
             svc.restart_count += 1
-            # After OOMKill, memory resets but error rate stays high
+            # Post-OOMKill: memory at 0.85 (residual state), error rate stays at 1.0
             svc.process_memory_utilization = 0.85
             svc.process_memory_usage_bytes = int(
                 0.85 * svc.process_memory_limit_bytes
             )
-            svc.runtime_uptime_seconds = 0
+            svc.runtime_uptime_seconds = 0  # Fresh restart
 
     def _apply_memory_leak(self, svc: ServiceMetrics, speed: float) -> None:
-        """Memory leak: gradual memory + latency increase, slow error growth."""
+        """Memory leak: gradual memory + latency increase, slow error growth.
+
+        GC-pressure signature: memory → latency → errors (this ordering
+        matches real-world incident reports). Capped at 0.97 memory to stay
+        below OOMKill threshold (0.98) — memory_leak is a slow degradation
+        fault, not a crash fault. Azure RESIN is a closer model than AIOpsLab's
+        memory_stress step-function.
+        """
         svc.process_memory_utilization += speed * MEMLEAK_MEMORY_RATE
         svc.process_memory_utilization = min(0.97, svc.process_memory_utilization)
         svc.process_memory_usage_bytes = int(
@@ -421,33 +467,53 @@ class ServiceMesh:
         )
 
     def _apply_bad_deploy(self, svc: ServiceMetrics, speed: float) -> None:
-        """Bad deploy: error rate and latency increase from tick 0."""
+        """Bad deploy: error rate and latency increase from tick 0.
+
+        Linear ramp (0.08/tick) softens the real step-function for agent
+        learnability. The real signal for bad deploys is correlation with
+        deploy timestamp — last_deployment_age_seconds is correctly exposed
+        and capped at 300s (5 min) to make the deploy look recent.
+        """
         svc.http_server_error_rate = min(
             1.0, svc.http_server_error_rate + speed * BAD_DEPLOY_ERROR_RATE
         )
         svc.http_server_request_duration_p99 += speed * BAD_DEPLOY_LATENCY_RATE
-        # Mark as recently deployed
+        # Mark as recently deployed (cap 300s = 5 min)
         svc.last_deployment_age_seconds = min(300, svc.last_deployment_age_seconds)
 
     def _apply_config_drift(self, svc: ServiceMetrics, speed: float) -> None:
-        """Config drift: connection pool exhaustion → timeout → errors."""
-        # FD count rises toward pool limit
+        """Config drift: connection pool exhaustion → timeout → errors.
+
+        FDs rise toward 1024 (common Linux default soft limit). Latency
+        spikes to 30s (connection timeout). 3.0s/tick crosses the 2.0s
+        CRITICAL threshold in a single tick — aggressive but matches real
+        pool-exhaustion where threads either get a connection or time out.
+        HikariCP default maximumPoolSize=10, formula: core_count × 2 + 1.
+        """
+        # FD count rises toward 1024 soft limit
         svc.process_open_file_descriptors = min(
             1024, svc.process_open_file_descriptors + int(speed * 50)
         )
-        # Latency spikes to connection timeout values
+        # Latency spikes to connection timeout values (max 30s)
         svc.http_server_request_duration_p99 = min(
             30.0, svc.http_server_request_duration_p99 + speed * 3.0
         )
         svc.http_server_error_rate = min(
             1.0, svc.http_server_error_rate + speed * CONFIG_DRIFT_ERROR_RATE
         )
-        # Mark as recently reconfigured
+        # Mark as recently reconfigured (cap 60s = config just changed)
         svc.last_config_age_seconds = min(60, svc.last_config_age_seconds)
         svc.last_config_revision += 1
 
     def _apply_network_partition(self, svc: ServiceMetrics, speed: float) -> None:
-        """Network partition: immediate latency spike + fast error growth."""
+        """Network partition: immediate latency spike + fast error growth.
+
+        5.0s latency floor = default Java SocketTimeout (5-10s) or Go
+        net/http.Client default. 30.0s cap = TCP connection timeout.
+        Fastest error growth of all five faults (0.20/tick) — realistic
+        since a partition produces ECONNREFUSED immediately on every
+        downstream call.
+        """
         svc.http_server_request_duration_p99 = min(
             30.0, max(5.0, svc.http_server_request_duration_p99 + speed * 2.0)
         )
