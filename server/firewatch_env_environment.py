@@ -34,11 +34,16 @@ try:
     )
     from ..simulation import ServiceMesh, generate_episode, FaultConfig, _count_blast_radius
     from ..actions import ActionHandler
-    from ..rewards import RewardEngine, EpisodeResult, grade, build_info_dict
+    from ..rewards import RewardEngine, EpisodeResult, grade, build_info_dict, compute_premature_exit_penalty
     from ..config import (
         TASKS,
-        SLO_BUDGET_INITIAL,
+        SLO_BUDGET_BY_DIFFICULTY,
         SLO_BURN_RATE_BY_DIFFICULTY,
+        SLO_BURN_RATE_MITIGATED_MULTIPLIER,
+        USER_FACING_SERVICES,
+        ESCALATE_INVESTIGATION_COST_MULTIPLIER,
+        INVESTIGATION_ACTIONS,
+        STATUS_THRESHOLD_DEGRADED_ERROR,
         SECONDS_PER_TICK,
     )
 except ImportError:
@@ -50,11 +55,16 @@ except ImportError:
     )
     from simulation import ServiceMesh, generate_episode, FaultConfig, _count_blast_radius
     from actions import ActionHandler
-    from rewards import RewardEngine, EpisodeResult, grade, build_info_dict
+    from rewards import RewardEngine, EpisodeResult, grade, build_info_dict, compute_premature_exit_penalty
     from config import (
         TASKS,
-        SLO_BUDGET_INITIAL,
+        SLO_BUDGET_BY_DIFFICULTY,
         SLO_BURN_RATE_BY_DIFFICULTY,
+        SLO_BURN_RATE_MITIGATED_MULTIPLIER,
+        USER_FACING_SERVICES,
+        ESCALATE_INVESTIGATION_COST_MULTIPLIER,
+        INVESTIGATION_ACTIONS,
+        STATUS_THRESHOLD_DEGRADED_ERROR,
         SECONDS_PER_TICK,
     )
 
@@ -65,6 +75,8 @@ def _build_observation(
     done: bool = False,
     reward: float | None = None,
     info: dict | None = None,
+    user_impact_active: bool = True,
+    current_slo_burn_rate: float = 1.5,
 ) -> SystemObservation:
     """Build a SystemObservation from current mesh state."""
     # Generate alerts from current service metrics
@@ -81,6 +93,8 @@ def _build_observation(
         action_history=action_history[-10:],  # Last 10 actions
         incident_declared=False,
         mttm_achieved_tick=mesh.incident_metrics.mttm_achieved_tick,
+        user_impact_active=user_impact_active,
+        current_slo_burn_rate=current_slo_burn_rate,
         # OpenEnv Observation fields
         done=done,
         reward=reward,
@@ -279,6 +293,12 @@ class FirewatchEnvironment(Environment):
             # Generate episode
             self._mesh, self._fault_config = generate_episode(difficulty, seed)
 
+            # Propagate initial fault so tick=0 observation shows degradation.
+            # Without this, generate_episode() sets fault config but hasn't run
+            # physics yet — all services appear healthy and a rational agent
+            # will immediately declare_resolved.
+            self._mesh.tick()
+
             # Reset stateful components
             self._reward_engine.reset()
             self._action_handler = ActionHandler()
@@ -303,6 +323,7 @@ class FirewatchEnvironment(Environment):
                 self._mesh, self._fault_config
             )
             self._episode_result.total_services_in_episode = len(self._mesh.services)
+            self._episode_result.initial_slo_budget = SLO_BUDGET_BY_DIFFICULTY[difficulty]
             self._action_history = []
             self._episode_done = False
 
@@ -366,6 +387,40 @@ class FirewatchEnvironment(Environment):
             # --- 1. mesh.tick() FIRST — autonomous degradation ---
             bcm_delta = self._mesh.tick()
 
+            # --- SLO burn with mitigation shield ---
+            # mesh.tick() already decremented slo_budget; undo it and reapply with shield.
+            difficulty = self._difficulty
+            base_burn = SLO_BURN_RATE_BY_DIFFICULTY[difficulty]
+
+            # Check user-facing service health for mitigation shield
+            user_impact_active = any(
+                self._mesh.services[s].http_server_error_rate > STATUS_THRESHOLD_DEGRADED_ERROR
+                for s in USER_FACING_SERVICES
+                if s in self._mesh.services
+            )
+
+            burn_this_tick = (
+                base_burn
+                if user_impact_active
+                else base_burn * SLO_BURN_RATE_MITIGATED_MULTIPLIER
+            )
+
+            # The mesh already applied degradation-scaled burn in tick().
+            # Restore the mesh's slo_budget to what it was before tick() burned it,
+            # then apply our mitigation-aware burn.
+            degraded_count = sum(1 for m in self._mesh.services.values() if m.status != "healthy")
+            total_services = len(self._mesh.services)
+            if total_services > 0:
+                old_burn = base_burn * (degraded_count / total_services)
+                # Restore then apply new burn
+                self._mesh.slo_budget = min(
+                    SLO_BUDGET_BY_DIFFICULTY[difficulty],
+                    self._mesh.slo_budget + old_burn
+                )
+                self._mesh.slo_budget = max(0.0, self._mesh.slo_budget - burn_this_tick)
+
+            _current_slo_burn_rate = burn_this_tick
+
             # --- 2. Record metrics for action handler history ---
             self._action_handler.record_tick(self._mesh)
 
@@ -410,12 +465,27 @@ class FirewatchEnvironment(Environment):
             # --- 5. Handle declare_resolved (sets incident_declared) ---
             incident_declared = action.action_type == "declare_resolved"
 
+            # --- Specialist discount: reduce SLO burn for investigation actions ---
+            if (
+                action.action_type in INVESTIGATION_ACTIONS
+                and self._action_handler.specialist_active_ticks > 0
+            ):
+                # Give back the SLO that would have been discounted
+                discount = burn_this_tick * (1.0 - ESCALATE_INVESTIGATION_COST_MULTIPLIER)
+                self._mesh.slo_budget = min(
+                    SLO_BUDGET_BY_DIFFICULTY[self._difficulty],
+                    self._mesh.slo_budget + discount
+                )
+                self._action_handler.specialist_active_ticks -= 1
+
             # --- 6. Build next observation ---
             next_obs = _build_observation(
                 mesh=self._mesh,
                 action_history=self._action_history,
                 done=False,  # Set below after checking termination
                 reward=None,  # Set below after computing reward
+                user_impact_active=user_impact_active,
+                current_slo_burn_rate=_current_slo_burn_rate,
             )
             # Update incident_declared
             next_obs.incident_declared = incident_declared
@@ -437,6 +507,19 @@ class FirewatchEnvironment(Environment):
                     "slo_breach_penalty": 0.0,
                     "total": 0.0,
                 }
+
+            # --- Premature exit penalty ---
+            if action.action_type == "declare_resolved":
+                mttm_achieved = next_obs.mttm_achieved_tick is not None
+                exit_penalty = compute_premature_exit_penalty(
+                    next_obs,
+                    tick_count=self._mesh.tick_count,
+                    mttm_achieved=mttm_achieved,
+                )
+                if exit_penalty < 0.0:
+                    reward += exit_penalty
+                    breakdown["premature_exit_penalty"] = round(exit_penalty, 6)
+                    breakdown["total"] = round(sum(v for k, v in breakdown.items() if k != "total"), 6)
 
             # --- 8. Update episode result ---
             self._episode_result.update(next_obs, wrong_action)

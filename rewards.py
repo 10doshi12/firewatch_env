@@ -30,6 +30,9 @@ try:
         GRADER_SPEED_MTTM_WEIGHT,
         GRADER_SPEED_BCM_WEIGHT,
         TASKS,
+        REWARD_PREMATURE_EXIT_BASE,
+        REWARD_PREMATURE_EXIT_SCALE,
+        HEALTHY_ERROR_RATE_THRESHOLD,
     )
 except ImportError:
     from models import SystemObservation, FirewatchAction
@@ -48,6 +51,9 @@ except ImportError:
         GRADER_SPEED_MTTM_WEIGHT,
         GRADER_SPEED_BCM_WEIGHT,
         TASKS,
+        REWARD_PREMATURE_EXIT_BASE,
+        REWARD_PREMATURE_EXIT_SCALE,
+        HEALTHY_ERROR_RATE_THRESHOLD,
     )
 
 
@@ -166,6 +172,7 @@ class EpisodeResult:
     wrong_actions: int = 0
     total_actions: int = 0
     final_slo_budget: float = 100.0
+    initial_slo_budget: float = 100.0   # Set at reset() time; used by grade() for SLO normalization
     bad_customer_minutes: float = 0.0
 
     # Static episode-level counts set once in reset() — never mutated by update()
@@ -220,6 +227,7 @@ class EpisodeResult:
             "mttm_ticks": self.mttm_ticks,
             "wrong_actions": self.wrong_actions,
             "final_slo_budget": round(self.final_slo_budget, 2),
+            "initial_slo_budget": round(self.initial_slo_budget, 2),
             "bad_customer_minutes": round(self.bad_customer_minutes, 2),
             "recovery_ratio": (
                 round(self.services_recovered / self.services_affected, 3)
@@ -273,7 +281,7 @@ def grade(episode_result: EpisodeResult, difficulty: str) -> float:
 
     # Fix 2: No cliff wipe — compute BCM and SLO unconditionally
     bcm_score = max(0.0, 1.0 - (er.bad_customer_minutes / max_bcm))
-    slo = max(0.0, min(1.0, er.final_slo_budget / 100.0))
+    slo = max(0.0, min(1.0, er.final_slo_budget / er.initial_slo_budget))
 
     # 2. Speed (25%) — composite of MTTM + BCM
     if er.mttm_ticks is not None:
@@ -310,6 +318,34 @@ def grade(episode_result: EpisodeResult, difficulty: str) -> float:
 
     score = max(0.0, raw - blast_penalty)
     return max(0.01, min(0.99, round(score, 2)))
+
+
+def compute_premature_exit_penalty(obs: SystemObservation, tick_count: int, mttm_achieved: bool) -> float:
+    """
+    Compute the premature exit penalty when declare_resolved is called.
+
+    Penalty fires only if ALL of:
+    1. mean error rate > HEALTHY_ERROR_RATE_THRESHOLD (system is still broken)
+    2. More than 1 tick has elapsed (prevents degenerate test case false positives)
+    3. mttm_achieved is False (MTTM achieved = user impact stopped; agent may declare)
+
+    Penalty scales with remaining brokenness:
+        BASE + (mean_error × SCALE)
+    At mean_error=1.0: -2.0 + (-3.0) = -5.0
+    At mean_error=0.10: -2.0 + (-0.30) = -2.30
+    At mean_error <= 0.05: 0.0 (no penalty)
+
+    Returns:
+        Float penalty (negative or zero).
+    """
+    if mttm_achieved:
+        return 0.0
+    if tick_count <= 1:
+        return 0.0
+    mean_error = _mean_error_rate(obs)
+    if mean_error <= HEALTHY_ERROR_RATE_THRESHOLD:
+        return 0.0
+    return REWARD_PREMATURE_EXIT_BASE + (mean_error * REWARD_PREMATURE_EXIT_SCALE)
 
 
 # ==========================================================================
@@ -406,7 +442,7 @@ def build_info_dict(
 
     # --- Episode end fields ---
     if done and episode_result is not None:
-        info["episode_score"] = round(episode_score or 0.0, 4)
+        info["episode_score"] = round(episode_score or 0.0, 2)
         info["episode_summary"] = episode_result.to_dict()
 
     return info
@@ -557,4 +593,5 @@ __all__ = [
     "EpisodeResult",
     "grade",
     "build_info_dict",
+    "compute_premature_exit_penalty",
 ]

@@ -336,6 +336,21 @@ class SystemObservation(_ObservationBase):
         default=None,
         description="Tick when user impact first reached zero. None until achieved.",
     )
+    user_impact_active: bool = Field(
+        default=True,
+        description=(
+            "True if any user-facing service (api-gateway or checkout-service) "
+            "has error_rate above the DEGRADED threshold. When False, SLO burn "
+            "rate is reduced to 20% via the mitigation shield."
+        ),
+    )
+    current_slo_burn_rate: float = Field(
+        default=1.5,
+        description=(
+            "The SLO burn rate applied this tick. Equal to the difficulty's "
+            "base burn rate when user_impact_active, or base × 0.2 when mitigated."
+        ),
+    )
     episode_score: float | None = Field(
         default=None,
         description="Final grader score in (0.0, 1.0) exclusive. Set only when done=True.",

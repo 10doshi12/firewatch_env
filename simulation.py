@@ -26,7 +26,7 @@ try:
         DEGRADATION_SPEED_BY_DIFFICULTY,
         SERVICE_MEMORY_LIMITS_BYTES,
         SLO_BURN_RATE_BY_DIFFICULTY,
-        SLO_BUDGET_INITIAL,
+        SLO_BUDGET_BY_DIFFICULTY,
         SECONDS_PER_TICK,
         CASCADE_ATTENUATION_FACTOR,
         CASCADE_MAX_DEPTH,
@@ -45,6 +45,7 @@ try:
         BCM_LATENCY_BASELINE,
         BCM_LATENCY_SCALE,
         BCM_LATENCY_WEIGHT,
+        BCM_LATENCY_NORMALIZED_MAX,
         TASKS,
     )
 except ImportError:
@@ -56,7 +57,7 @@ except ImportError:
         DEGRADATION_SPEED_BY_DIFFICULTY,
         SERVICE_MEMORY_LIMITS_BYTES,
         SLO_BURN_RATE_BY_DIFFICULTY,
-        SLO_BUDGET_INITIAL,
+        SLO_BUDGET_BY_DIFFICULTY,
         SECONDS_PER_TICK,
         CASCADE_ATTENUATION_FACTOR,
         CASCADE_MAX_DEPTH,
@@ -75,6 +76,7 @@ except ImportError:
         BCM_LATENCY_BASELINE,
         BCM_LATENCY_SCALE,
         BCM_LATENCY_WEIGHT,
+        BCM_LATENCY_NORMALIZED_MAX,
         TASKS,
     )
 
@@ -109,12 +111,12 @@ class IncidentMetrics:
     _zero_bcm_streak: int = field(default=0, repr=False)
 
     def update(self, bcm_delta: float, current_tick: int) -> None:
-        """Update BCM and check MTTM achievement (requires 3 consecutive zero-BCM ticks)."""
+        """Update BCM and check MTTM achievement (requires 2 consecutive zero-BCM ticks)."""
         self.bad_customer_minutes += bcm_delta
         if bcm_delta <= 0.0 and current_tick > 0:
             self._zero_bcm_streak += 1
-            if self._zero_bcm_streak >= 3 and not self._mttm_locked:
-                self.mttm_achieved_tick = current_tick - 2
+            if self._zero_bcm_streak >= 2 and not self._mttm_locked:
+                self.mttm_achieved_tick = current_tick - 1
                 self._mttm_locked = True
         else:
             self._zero_bcm_streak = 0
@@ -265,7 +267,7 @@ class ServiceMesh:
 
         self.tick_count: int = 0
         self.sim_time_seconds: int = 0
-        self.slo_budget: float = SLO_BUDGET_INITIAL
+        self.slo_budget: float = SLO_BUDGET_BY_DIFFICULTY[difficulty]
         self.slo_burn_rate: float = SLO_BURN_RATE_BY_DIFFICULTY[difficulty]
         self.incident_metrics = IncidentMetrics()
 
@@ -346,23 +348,48 @@ class ServiceMesh:
             self._apply_network_partition(svc, speed)
 
     def _apply_recovery_physics(self) -> None:
-        """Gradually return metrics to healthy levels when a fault is halved."""
-        # We decrease error rate and latency of the root cause linearly
-        fc = self.fault_config
-        svc = self.services.get(fc.root_cause_service)
-        if svc is None:
-            return
+        """Gradually return metrics to healthy levels when fault is halted.
 
-        # Recovery rate is roughly the same scale as degradation, slightly faster
+        Recovers BOTH the root cause service AND all cascaded downstream
+        services. Without downstream recovery, health_improvement stays
+        near zero because cascade victims never heal.
+        """
+        fc = self.fault_config
         speed = fc.degradation_speed
 
-        svc.http_server_error_rate = max(0.01, svc.http_server_error_rate - speed * 0.15)
-        
-        # Latency drops faster once connection pools/resources free up
-        target_lat = 0.1
-        current_lat = svc.http_server_request_duration_p99
-        if current_lat > target_lat:
-            svc.http_server_request_duration_p99 = max(target_lat, current_lat - speed * 1.5)
+        # Recover root cause service
+        svc = self.services.get(fc.root_cause_service)
+        if svc is not None:
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate - speed * 0.15)
+
+            target_lat = 0.1
+            current_lat = svc.http_server_request_duration_p99
+            if current_lat > target_lat:
+                svc.http_server_request_duration_p99 = max(target_lat, current_lat - speed * 1.5)
+
+            # Recover memory for OOM/memory_leak faults
+            if fc.fault_type in ("oom", "memory_leak") and svc.process_memory_utilization > 0.40:
+                svc.process_memory_utilization = max(0.25, svc.process_memory_utilization - speed * 0.10)
+                svc.process_memory_usage_bytes = int(
+                    svc.process_memory_utilization * svc.process_memory_limit_bytes
+                )
+
+        # Recover ALL cascaded downstream services
+        for name, metrics in self.services.items():
+            if name == fc.root_cause_service:
+                continue
+            if name in fc.red_herring_services:
+                continue  # Red herrings keep static degradation
+            # Gradually reduce cascaded error contribution
+            if metrics.http_server_error_rate > 0.02:
+                metrics.http_server_error_rate = max(
+                    0.01, metrics.http_server_error_rate - speed * 0.10
+                )
+            # Gradually reduce cascaded latency
+            if metrics.http_server_request_duration_p99 > 0.15:
+                metrics.http_server_request_duration_p99 = max(
+                    0.1, metrics.http_server_request_duration_p99 - speed * 1.0
+                )
 
     def _apply_oom(self, svc: ServiceMetrics, speed: float) -> None:
         """OOM: memory grows rapidly, then OOMKill at 0.98."""
@@ -496,8 +523,9 @@ class ServiceMesh:
                 (metrics.http_server_request_duration_p99 - BCM_LATENCY_BASELINE)
                 / BCM_LATENCY_SCALE,
             )
+            latency_clamped = min(latency_norm, BCM_LATENCY_NORMALIZED_MAX)
             impact = (
-                metrics.http_server_error_rate + latency_norm * BCM_LATENCY_WEIGHT
+                metrics.http_server_error_rate + latency_clamped * BCM_LATENCY_WEIGHT
             )
             bcm_delta += impact * (SECONDS_PER_TICK / 60.0)
         return bcm_delta

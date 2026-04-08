@@ -13,7 +13,6 @@ try:
     from .config import (
         HEALTHY_ERROR_RATE_THRESHOLD,
         FULL_DEPENDENCY_GRAPH,
-        STATUS_THRESHOLD_DEGRADED_ERROR,
         SLO_BURN_RATE_BY_DIFFICULTY,
         SECONDS_PER_TICK,
         SYSCALL_PATTERNS,
@@ -24,13 +23,15 @@ try:
         TRAFFIC_SHIFT_LATENCY_PENALTY,
         TRAFFIC_SHIFT_MIN_DRAIN,
         TRAFFIC_SHIFT_MAX_DRAIN,
+        ESCALATE_SPECIALIST_TICKS,
+        ESCALATE_INVESTIGATION_COST_MULTIPLIER,
+        INVESTIGATION_ACTIONS,
     )
 except ImportError:
     from models import FirewatchAction, ActionResult
     from config import (
         HEALTHY_ERROR_RATE_THRESHOLD,
         FULL_DEPENDENCY_GRAPH,
-        STATUS_THRESHOLD_DEGRADED_ERROR,
         SLO_BURN_RATE_BY_DIFFICULTY,
         SECONDS_PER_TICK,
         SYSCALL_PATTERNS,
@@ -41,6 +42,9 @@ except ImportError:
         TRAFFIC_SHIFT_LATENCY_PENALTY,
         TRAFFIC_SHIFT_MIN_DRAIN,
         TRAFFIC_SHIFT_MAX_DRAIN,
+        ESCALATE_SPECIALIST_TICKS,
+        ESCALATE_INVESTIGATION_COST_MULTIPLIER,
+        INVESTIGATION_ACTIONS,
     )
 
 if TYPE_CHECKING:
@@ -67,6 +71,9 @@ class ActionHandler:
         self._metric_history: dict[str, list[dict[str, float]]] = {}
         # Track active circuit breakers: {service_name: ticks_remaining}
         self._circuit_breakers: dict[str, int] = {}
+        self.specialist_active_ticks: int = 0
+        # Counts how many remaining investigation actions get the specialist discount.
+        # Set by escalate action. Decremented by environment.py when applying discount.
 
     def record_tick(self, mesh: "ServiceMesh") -> None:
         """Record current metrics for history tracking. Call after each tick."""
@@ -144,7 +151,7 @@ class ActionHandler:
         # --- Remediation actions ---
         # Check for wrong action: remediating a healthy service
         target_metrics = mesh.services[target]
-        is_wrong = target_metrics.http_server_error_rate < STATUS_THRESHOLD_DEGRADED_ERROR
+        is_wrong = target_metrics.http_server_error_rate < HEALTHY_ERROR_RATE_THRESHOLD
 
         if at == "restart_service":
             return self._restart_service(target, mesh, fault_config, is_wrong)
@@ -645,6 +652,19 @@ class ActionHandler:
                 False,
             )
 
+        if target == fc.root_cause_service and fc.fault_type == "network_partition":
+            # Correct: restart re-establishes connections, halts partition
+            mesh.fault_halted = True
+            svc.http_server_error_rate = max(0.0, svc.http_server_error_rate * 0.3)
+            svc.http_server_request_duration_p99 = max(0.1, svc.http_server_request_duration_p99 * 0.2)
+            svc.runtime_uptime_seconds = 0
+            svc.restart_count += 1
+            return (
+                f"Restarted {target}. Network connections re-established. "
+                f"Error rate declining — partition resolved.",
+                False,
+            )
+
         # Wrong remediation type for this fault (but service is degraded)
         svc.restart_count += 1
         svc.runtime_uptime_seconds = 0
@@ -980,18 +1000,13 @@ class ActionHandler:
             False,
         )
 
-    def _escalate(
-        self, mesh: "ServiceMesh"
-    ) -> tuple[str, bool]:
-        """Escalate — costs 3 ticks of SLO budget."""
-        # Burn 3x the normal SLO rate
-        extra_burn = mesh.slo_burn_rate * 3.0
-        mesh.slo_budget -= extra_burn
-        mesh.slo_budget = max(0.0, mesh.slo_budget)
+    def _escalate(self, mesh: "ServiceMesh") -> tuple[str, bool]:
+        """Grant specialist discount on next investigation actions."""
+        self.specialist_active_ticks = ESCALATE_SPECIALIST_TICKS
         return (
-            f"Escalation initiated. Specialist team paged. Response "
-            f"expected in 3 tick-equivalents. SLO budget cost: "
-            f"{extra_burn:.1f}%. Remaining: {mesh.slo_budget:.1f}%.",
+            f"Escalation initiated. Specialist team paged. "
+            f"Next {ESCALATE_SPECIALIST_TICKS} investigation actions will cost "
+            f"{int(ESCALATE_INVESTIGATION_COST_MULTIPLIER * 100)}% of normal SLO budget.",
             False,
         )
 

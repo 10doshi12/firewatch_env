@@ -344,7 +344,7 @@ class TestTrafficShift:
         action = FirewatchAction(
             action_type="traffic_shift",
             target_service=target,
-            parameters={"drain_percentage": 0.20},
+            parameters={"drain_percentage": 0.02},
         )
         feedback, wrong = handler.apply(action, mesh, fc)
         assert "too low" in feedback.lower() or "minimum" in feedback.lower()

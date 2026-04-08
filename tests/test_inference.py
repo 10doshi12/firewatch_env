@@ -60,10 +60,10 @@ def test_format_success():
 
 
 def test_format_score():
-    """score formatted to exactly 3 decimal places."""
-    assert fmt_score(0.8234) == "0.823"
-    assert fmt_score(0.0) == "0.000"
-    assert fmt_score(1.0) == "1.000"
+    """score formatted to exactly 2 decimal places."""
+    assert fmt_score(0.8234) == "0.82"
+    assert fmt_score(0.0) == "0.00"
+    assert fmt_score(1.0) == "1.00"
     print("✓ test_format_score PASSED")
 
 
@@ -186,7 +186,7 @@ def test_stdout_format_compliance():
     success = score >= SUCCESS_SCORE_THRESHOLD
     end_line = f"[END] success={fmt_success(success)} steps={len(actions_taken)} score={fmt_score(score)} rewards={fmt_rewards_list(rewards)}"
     assert re.match(
-        r"^\[END\] success=(true|false) steps=\d+ score=\d+\.\d{3} rewards=(-?\d+\.\d{2},?)+$",
+        r"^\[END\] success=(true|false) steps=\d+ score=\d+\.\d{2} rewards=(-?\d+\.\d{2},?)+$",
         end_line
     ), f"Bad END: {end_line}"
 

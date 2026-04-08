@@ -109,14 +109,19 @@ STATUS_THRESHOLD_DEGRADED_LATENCY: float = 0.50  # latency_p99 >= 0.50s → degr
 HEALTHY_ERROR_RATE_THRESHOLD: float = 0.05
 
 # --- SLO Budget (PRD §7.4, §7.6) ---
-# Starting error budget percentage. Depletes each tick at difficulty-specific rate.
-SLO_BUDGET_INITIAL: float = 100.0
+# SLO budget per difficulty. Formula: max_ticks × burn_rate, so a do-nothing
+# agent exhausts exactly its tick budget — SLO breach only for wasted actions.
+SLO_BUDGET_BY_DIFFICULTY: dict[str, float] = {
+    "easy":   20 * 1.5,   # 30.0
+    "medium": 30 * 2.0,   # 60.0
+    "hard":   40 * 3.0,   # 120.0
+}
 
-# SLO burn rate per tick by difficulty. Higher = faster budget depletion.
+# SLO burn rate per tick by difficulty; burn rate increases with difficulty as PRD §3.3 requires.
 SLO_BURN_RATE_BY_DIFFICULTY: dict[str, float] = {
-    "easy": 3.0,
-    "medium": 2.5,
-    "hard": 2.0,
+    "easy":   1.5,
+    "medium": 2.0,
+    "hard":   3.0,
 }
 
 # --- Degradation Speed (PRD §7.6) ---
@@ -156,6 +161,39 @@ REWARD_TIME_COST: float = -0.05           # Constant negative per tick — creat
 REWARD_WRONG_ACTION_PENALTY: float = -0.5  # Remediating a healthy service
 REWARD_SLO_BREACH_PENALTY: float = -2.0   # Terminal penalty when budget hits zero
 
+# --- SLO Mitigation Shield ---
+# Burn rate multiplier when user-facing services are below DEGRADED threshold.
+# Earned by actually stopping user impact — not by calling circuit_break.
+SLO_BURN_RATE_MITIGATED_MULTIPLIER: float = 0.2
+
+# User-facing services whose health determines the mitigation shield
+USER_FACING_SERVICES: list[str] = ["api-gateway", "checkout-service"]
+
+# --- Premature Exit Penalty ---
+# Scaled penalty when agent calls declare_resolved with system still broken.
+# Combined: BASE + (mean_error × SCALE). Always worse than SLO breach (-2.0).
+REWARD_PREMATURE_EXIT_BASE: float = -2.0
+REWARD_PREMATURE_EXIT_SCALE: float = -3.0
+
+# --- Escalate Specialist Mechanic ---
+ESCALATE_SPECIALIST_TICKS: int = 2
+# Number of subsequent investigation actions that receive the specialist discount.
+ESCALATE_INVESTIGATION_COST_MULTIPLIER: float = 0.5
+# SLO burn multiplier applied to investigation actions while specialist is active.
+
+# Which action types qualify for the specialist discount
+INVESTIGATION_ACTIONS: frozenset[str] = frozenset({
+    "fetch_logs",
+    "get_metrics_detail",
+    "trace_dependencies",
+    "strace_process",
+    "profiler_dump",
+    "check_gc_pressure",
+    "trace_distributed_request",
+    "inspect_thread_pool",
+    "inspect_commit_diff",
+})
+
 # --- Grader Weights (PRD §3.5) ---
 # Unified formula: recovery(40%) + speed/MTTM(25%) + precision(20%) + SLO(15%)
 GRADER_WEIGHT_RECOVERY: float = 0.40
@@ -188,13 +226,22 @@ SERVICE_MEMORY_LIMITS_BYTES: dict[str, int] = {
 # --- Red Herring Degradation (PRD §8.6) ---
 # Static error rate range for red herring services (does not change per tick).
 RED_HERRING_ERROR_RATE_MIN: float = 0.05
-RED_HERRING_ERROR_RATE_MAX: float = 0.15
+RED_HERRING_ERROR_RATE_MAX: float = 0.09
+# Must stay strictly below STATUS_THRESHOLD_DEGRADED_ERROR (0.10)
+# so any remediation of a red herring triggers the wrong-action penalty.
+
+assert RED_HERRING_ERROR_RATE_MAX < STATUS_THRESHOLD_DEGRADED_ERROR, \
+    "Red herring max error must be below degraded threshold to enforce wrong-action penalty"
 
 # --- BCM Calculation Constants (PRD §8.5) ---
 # Latency normalization: latency_normalized = max(0, (latency_p99 - 0.5) / 2.0)
 BCM_LATENCY_BASELINE: float = 0.5   # Latency below this contributes zero BCM
 BCM_LATENCY_SCALE: float = 2.0      # Normalization divisor
 BCM_LATENCY_WEIGHT: float = 0.5     # Latency contribution relative to error_rate
+BCM_LATENCY_NORMALIZED_MAX: float = 2.0
+# Maximum BCM penalty a single service's latency can inflict per tick,
+# before BCM_LATENCY_WEIGHT is applied. Prevents latency dominating BCM
+# calculation relative to error_rate contribution.
 
 
 # ==========================================================================
@@ -421,7 +468,7 @@ BAD_DEPLOY_DIFFS_TEMPLATES: dict[str, str] = {
         "@@ -45,7 +45,7 @@\n"
         "     private void processPayment(Order order) {\n"
         "-        httpClient.setTimeout(3000);  // 3 second timeout\n"
-        "+        httpClient.setTimeout(null);   // OOPS: removed timeout\n"
+        "+        httpClient.setTimeout(0);      // OOPS: infinite timeout\n"
         "         Response resp = httpClient.post(\"/charge\", order);\n"
     ),
     "null_pointer": (
@@ -442,7 +489,7 @@ BAD_DEPLOY_DIFFS_TEMPLATES: dict[str, str] = {
         "     private void retryFailedOrders() {\n"
         "-        for (int i = 0; i < pendingOrders.size(); i++) {\n"
         "+        while (true) {  // OOPS: infinite loop\n"
-        "             processOrder(pendingOrders.get(i));\n"
+        "             processOrder(pendingOrders.get(0)); // OOPS: infinite loop on first order\n"
     ),
     "config_typo": (
         "--- a/config/application.yml\n"
@@ -457,7 +504,9 @@ BAD_DEPLOY_DIFFS_TEMPLATES: dict[str, str] = {
 # --- traffic_shift parameters ---
 # Source: Kubernetes draining, Istio VirtualService weights, AWS ELB
 TRAFFIC_SHIFT_LATENCY_PENALTY: float = 1.15   # 15% latency increase for cross-zone routing
-TRAFFIC_SHIFT_MIN_DRAIN: float = 0.50          # Minimum 50% drain for observable effect
+TRAFFIC_SHIFT_MIN_DRAIN: float = 0.05
+# Minimum traffic drain fraction; allows canary-style 5% incremental drains.
+# Source: Kubernetes/Istio VirtualService canary patterns
 TRAFFIC_SHIFT_MAX_DRAIN: float = 0.95          # Max 95% (keep 5% for health checks)
 
 
@@ -482,7 +531,7 @@ __all__ = [
     "STATUS_THRESHOLD_DEGRADED_ERROR",
     "STATUS_THRESHOLD_DEGRADED_LATENCY",
     "HEALTHY_ERROR_RATE_THRESHOLD",
-    "SLO_BUDGET_INITIAL",
+    "SLO_BUDGET_BY_DIFFICULTY",
     "SLO_BURN_RATE_BY_DIFFICULTY",
     "DEGRADATION_SPEED_BY_DIFFICULTY",
     "OOM_MEMORY_RATE",
@@ -512,6 +561,14 @@ __all__ = [
     "BCM_LATENCY_BASELINE",
     "BCM_LATENCY_SCALE",
     "BCM_LATENCY_WEIGHT",
+    "BCM_LATENCY_NORMALIZED_MAX",
+    "SLO_BURN_RATE_MITIGATED_MULTIPLIER",
+    "USER_FACING_SERVICES",
+    "REWARD_PREMATURE_EXIT_BASE",
+    "REWARD_PREMATURE_EXIT_SCALE",
+    "ESCALATE_SPECIALIST_TICKS",
+    "ESCALATE_INVESTIGATION_COST_MULTIPLIER",
+    "INVESTIGATION_ACTIONS",
     "TaskConfig",
     "TASKS",
     "SYSCALL_PATTERNS",
