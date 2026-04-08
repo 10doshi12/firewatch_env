@@ -27,7 +27,7 @@ except ImportError:
     pass  # python-dotenv optional — falls back to system env vars
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME   = os.getenv("MODEL_NAME",   "Qwen/Qwen2.5-7B-Instruct")
+MODEL_NAME   = os.getenv("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct")
 API_KEY      = os.getenv("HF_TOKEN")
 DEFAULT_SPACE_URL = "https://10doshi12-firewatch-env.hf.space"
 
