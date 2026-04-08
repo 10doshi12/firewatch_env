@@ -16,6 +16,14 @@ try:
         STATUS_THRESHOLD_DEGRADED_ERROR,
         SLO_BURN_RATE_BY_DIFFICULTY,
         SECONDS_PER_TICK,
+        SYSCALL_PATTERNS,
+        PROFILE_PATTERNS,
+        GC_PRESSURE_PATTERNS,
+        THREAD_POOL_PATTERNS,
+        BAD_DEPLOY_DIFFS_TEMPLATES,
+        TRAFFIC_SHIFT_LATENCY_PENALTY,
+        TRAFFIC_SHIFT_MIN_DRAIN,
+        TRAFFIC_SHIFT_MAX_DRAIN,
     )
 except ImportError:
     from models import FirewatchAction, ActionResult
@@ -25,10 +33,19 @@ except ImportError:
         STATUS_THRESHOLD_DEGRADED_ERROR,
         SLO_BURN_RATE_BY_DIFFICULTY,
         SECONDS_PER_TICK,
+        SYSCALL_PATTERNS,
+        PROFILE_PATTERNS,
+        GC_PRESSURE_PATTERNS,
+        THREAD_POOL_PATTERNS,
+        BAD_DEPLOY_DIFFS_TEMPLATES,
+        TRAFFIC_SHIFT_LATENCY_PENALTY,
+        TRAFFIC_SHIFT_MIN_DRAIN,
+        TRAFFIC_SHIFT_MAX_DRAIN,
     )
 
 if TYPE_CHECKING:
     from .simulation import ServiceMesh, FaultConfig
+
 
 
 class ActionHandler:
@@ -144,6 +161,29 @@ class ActionHandler:
         if at == "circuit_break":
             return self._circuit_break(target, mesh, fault_config, is_wrong)
 
+        # --- Advanced diagnostic investigation actions (SPEC-9) ---
+        if at == "strace_process":
+            return self._strace_process(target, mesh, fault_config)
+
+        if at == "profiler_dump":
+            return self._profiler_dump(target, mesh, fault_config)
+
+        if at == "check_gc_pressure":
+            return self._check_gc_pressure(target, mesh, fault_config)
+
+        if at == "trace_distributed_request":
+            return self._trace_distributed_request(target, mesh)
+
+        if at == "inspect_thread_pool":
+            return self._inspect_thread_pool(target, mesh, fault_config)
+
+        if at == "inspect_commit_diff":
+            return self._inspect_commit_diff(target, mesh, fault_config)
+
+        # --- Advanced remediation actions (SPEC-9) ---
+        if at == "traffic_shift":
+            return self._traffic_shift(target, mesh, fault_config, action.parameters)
+
         return (f"Unknown action type: {at}. No action taken.", False)
 
     # ------------------------------------------------------------------
@@ -250,6 +290,299 @@ class ActionHandler:
                     f"degraded — investigate whether {target} is a victim of "
                     f"upstream fault propagation."
                 )
+
+        return (feedback, False)
+
+    def _strace_process(
+        self,
+        target: str,
+        mesh: "ServiceMesh",
+        fc: "FaultConfig",
+    ) -> tuple[str, bool]:
+        """
+        Simulates strace syscall tracing.
+        Returns syscall frequency distribution based on fault type.
+        Differentiates kernel-level resource exhaustion from application bugs.
+        """
+        if target not in mesh.services:
+            return (
+                f"Invalid target: {target} is not an active service. No action taken.",
+                False,
+            )
+
+        svc = mesh.services[target]
+
+        if target == fc.root_cause_service:
+            pattern = SYSCALL_PATTERNS.get(fc.fault_type, SYSCALL_PATTERNS["healthy"])
+            context = f"(ROOT CAUSE: {fc.fault_type})"
+        elif svc.status in ("degraded", "critical", "down"):
+            pattern = SYSCALL_PATTERNS["healthy"]
+            context = "(Cascaded degradation - normal syscall pattern)"
+        else:
+            pattern = SYSCALL_PATTERNS["healthy"]
+            context = "(Healthy baseline)"
+
+        syscall_lines = "\n".join(
+            f"  {syscall:>12s}: {freq * 100:5.1f}%"
+            for syscall, freq in sorted(pattern.items(), key=lambda x: -x[1])
+        )
+
+        interpretation = ""
+        if fc.fault_type == "oom" and target == fc.root_cause_service:
+            interpretation = (
+                "\n[Analysis] High mmap/brk frequency indicates aggressive heap expansion. "
+                "Process is requesting memory from kernel faster than it can be allocated. "
+                "OOMKill likely imminent."
+            )
+        elif fc.fault_type == "config_drift" and target == fc.root_cause_service:
+            interpretation = (
+                "\n[Analysis] High accept() frequency with EMFILE errors. "
+                "File descriptor exhaustion - connection pool misconfiguration."
+            )
+
+        feedback = (
+            f"strace output for {target} (sampled over 1 tick):\n"
+            f"{syscall_lines}\n"
+            f"{context}{interpretation}"
+        )
+        return (feedback, False)
+
+    def _profiler_dump(
+        self,
+        target: str,
+        mesh: "ServiceMesh",
+        fc: "FaultConfig",
+    ) -> tuple[str, bool]:
+        """
+        Simulates CPU profiler (pprof/py-spy flame graph).
+        Categorizes CPU time into: user code, I/O wait, GC, kernel.
+        """
+        if target not in mesh.services:
+            return (f"Invalid target: {target} is not an active service.", False)
+
+        svc = mesh.services[target]
+
+        if target == fc.root_cause_service:
+            pattern = PROFILE_PATTERNS.get(fc.fault_type, PROFILE_PATTERNS["healthy"])
+        elif svc.http_server_request_duration_p99 > 1.0:
+            pattern = PROFILE_PATTERNS["network_partition"]
+        else:
+            pattern = PROFILE_PATTERNS["healthy"]
+
+        profile_lines = "\n".join(
+            f"  {category:>15s}: {pct * 100:5.1f}%"
+            for category, pct in sorted(pattern.items(), key=lambda x: -x[1])
+        )
+
+        interpretation = ""
+        if pattern.get("user_code_cpu", 0) > 0.70:
+            interpretation = (
+                "\n[Diagnosis] CPU-bound: Application code consuming majority of cycles. "
+                "Likely infinite loop, hot regex, or algorithmic issue. "
+                "Check recent deployments."
+            )
+        elif pattern.get("io_wait", 0) > 0.70:
+            interpretation = (
+                "\n[Diagnosis] I/O-bound: Process blocked waiting on network/disk. "
+                "Not a local CPU issue - investigate upstream dependencies."
+            )
+        elif pattern.get("gc", 0) > 0.40:
+            interpretation = (
+                "\n[Diagnosis] GC-bound: Garbage collector consuming >40% of CPU. "
+                "Memory leak or insufficient heap. Run check_gc_pressure for details."
+            )
+
+        feedback = (
+            f"Profile dump for {target} (1-second sample):\n"
+            f"{profile_lines}\n"
+            f"Total samples: 10,000{interpretation}"
+        )
+        return (feedback, False)
+
+    def _check_gc_pressure(
+        self,
+        target: str,
+        mesh: "ServiceMesh",
+        fc: "FaultConfig",
+    ) -> tuple[str, bool]:
+        """
+        Simulates runtime GC metrics (JVM/V8/Go).
+        Shows GC pause time, cycle frequency, heap reclamation efficiency.
+        Updates service's runtime_gc_* fields with measured values.
+        """
+        if target not in mesh.services:
+            return (f"Invalid target: {target}.", False)
+
+        svc = mesh.services[target]
+
+        if (
+            target == fc.root_cause_service
+            and fc.fault_type in ("memory_leak", "oom")
+        ):
+            pattern = GC_PRESSURE_PATTERNS[fc.fault_type]
+        elif svc.process_memory_utilization > 0.70:
+            pattern = GC_PRESSURE_PATTERNS["memory_leak"]
+        else:
+            pattern = GC_PRESSURE_PATTERNS["healthy"]
+
+        # Update live service metrics with GC data
+        svc.runtime_gc_pause_duration_ms = pattern["gc_pause_time_ms"]
+        svc.runtime_gc_count_per_second = pattern["gc_cycles_per_second"]
+
+        feedback = (
+            f"GC pressure analysis for {target}:\n"
+            f"  GC cycles/sec:     {pattern['gc_cycles_per_second']:>6.1f}"
+            f" ({_gc_rate_label(pattern['gc_cycles_per_second'])})\n"
+            f"  Avg pause time:    {pattern['gc_pause_time_ms']:>6.1f}ms"
+            f" ({_gc_pause_label(pattern['gc_pause_time_ms'])})\n"
+            f"  Heap after GC:     {pattern['heap_after_gc_mb']:>6.0f}MB\n"
+            f"  GC CPU usage:      {pattern['gc_cpu_percent']:>6.1f}%\n"
+        )
+
+        if pattern["gc_cycles_per_second"] > 30:
+            feedback += (
+                "\n[CRITICAL] GC thrashing detected. Runtime spending majority of time in "
+                "garbage collection. Heap is not being reclaimed effectively — indicates "
+                "memory leak or insufficient heap size."
+            )
+        elif pattern["gc_pause_time_ms"] > 500:
+            feedback += (
+                "\n[WARNING] Long stop-the-world pauses causing latency spikes. "
+                "Consider heap tuning or switching to concurrent GC."
+            )
+
+        return (feedback, False)
+
+    def _trace_distributed_request(
+        self,
+        target: str,
+        mesh: "ServiceMesh",
+    ) -> tuple[str, bool]:
+        """
+        Simulates distributed tracing (Jaeger/Zipkin/OTel).
+        Traces request from api-gateway through the call chain to target,
+        showing per-service span durations.
+        Different from trace_dependencies (static topology) — this shows dynamic latency.
+        """
+        if target not in mesh.services:
+            return (f"Invalid target: {target}.", False)
+
+        def _get_downstream(service: str) -> set[str]:
+            downstream: set[str] = set()
+            for dep in mesh.dependency_graph.get(service, []):
+                downstream.add(dep)
+                downstream.update(_get_downstream(dep))
+            return downstream
+
+        trace_spans: list[dict] = []
+        total_duration_ms = 0.0
+
+        def _build_trace(current: str, depth: int = 0) -> None:
+            nonlocal total_duration_ms
+            if current not in mesh.services:
+                return
+            svc = mesh.services[current]
+            duration_ms = svc.http_server_request_duration_p99 * 1000
+            total_duration_ms += duration_ms
+            trace_spans.append({
+                "service": current,
+                "duration_ms": duration_ms,
+                "depth": depth,
+                "status": svc.status,
+            })
+            for dep in mesh.dependency_graph.get(current, []):
+                if dep == target or target in _get_downstream(dep):
+                    _build_trace(dep, depth + 1)
+                    break
+
+        entry = "api-gateway" if "api-gateway" in mesh.services else target
+        _build_trace(entry)
+
+        if not trace_spans:
+            return (f"distributed_trace: no services found in call chain for {target}.", False)
+
+        bottleneck = max(trace_spans, key=lambda s: s["duration_ms"])
+
+        trace_lines = []
+        for span in trace_spans:
+            indent = "  " * span["depth"]
+            status_sym = (
+                "⚠" if span["status"] in ("degraded", "critical")
+                else ("✗" if span["status"] == "down" else "✓")
+            )
+            trace_lines.append(
+                f"{indent}{status_sym} {span['service']:<20s} {span['duration_ms']:>7.1f}ms"
+            )
+
+        feedback = (
+            f"Distributed trace to {target}:\n"
+            + "\n".join(trace_lines)
+            + f"\n\nTotal duration: {total_duration_ms:.1f}ms\n"
+            + f"[Bottleneck] {bottleneck['service']} ({bottleneck['duration_ms']:.1f}ms, "
+            + f"{bottleneck['duration_ms'] / total_duration_ms * 100:.1f}% of total)\n"
+        )
+
+        if bottleneck["service"] != target:
+            feedback += (
+                f"[Analysis] {target} is not the bottleneck. "
+                f"Investigate {bottleneck['service']}."
+            )
+
+        return (feedback, False)
+
+    def _inspect_thread_pool(
+        self,
+        target: str,
+        mesh: "ServiceMesh",
+        fc: "FaultConfig",
+    ) -> tuple[str, bool]:
+        """
+        Simulates thread pool / worker stats.
+        Shows active threads, max capacity, queue depth, queue time.
+        Updates service runtime_jvm_* fields with measured values.
+        Saturation threshold: 200 active requests (PRD §7.2).
+        """
+        if target not in mesh.services:
+            return (f"Invalid target: {target}.", False)
+
+        svc = mesh.services[target]
+
+        if svc.http_server_active_requests >= 180:
+            pattern = THREAD_POOL_PATTERNS["saturated"]
+        elif svc.http_server_active_requests >= 120:
+            pattern = THREAD_POOL_PATTERNS["high_load"]
+        else:
+            pattern = THREAD_POOL_PATTERNS["healthy"]
+
+        # Update live service metrics
+        svc.runtime_jvm_threads_count = pattern["active_threads"]
+        svc.runtime_jvm_threads_max = pattern["max_threads"]
+        svc.runtime_thread_pool_queue_depth = pattern["queued_requests"]
+
+        utilization_pct = (pattern["active_threads"] / pattern["max_threads"]) * 100
+
+        feedback = (
+            f"Thread pool stats for {target}:\n"
+            f"  Active threads:    {pattern['active_threads']:>4d} / {pattern['max_threads']}"
+            f" ({utilization_pct:.1f}% utilized)\n"
+            f"  Queued requests:   {pattern['queued_requests']:>4d}\n"
+            f"  Avg queue time:    {pattern['avg_queue_time_ms']:>4d}ms\n"
+        )
+
+        if pattern["active_threads"] == pattern["max_threads"]:
+            feedback += (
+                "\n[CRITICAL] Thread pool saturated. All workers busy. "
+                "New requests queuing indefinitely. "
+                "\n[Cause] Either:\n"
+                "  1. Threads blocked on slow downstream I/O (check trace_distributed_request)\n"
+                "  2. CPU-bound task monopolizing threads (check profiler_dump)\n"
+                "  3. Need to scale replicas to increase total thread capacity"
+            )
+        elif pattern["queued_requests"] > 500:
+            feedback += (
+                "\n[WARNING] High request backlog. "
+                "System approaching saturation. Consider scaling."
+            )
 
         return (feedback, False)
 
@@ -510,6 +843,130 @@ class ActionHandler:
             False,
         )
 
+    def _traffic_shift(
+        self,
+        target: str,
+        mesh: "ServiceMesh",
+        fc: "FaultConfig",
+        parameters: dict,
+    ) -> tuple[str, bool]:
+        """
+        Graceful traffic routing — drains percentage of traffic from target.
+        Trades slight latency increase (cross-zone routing) for error rate reduction.
+        Unlike circuit_break (full cutoff), this is a partial traffic shift.
+        """
+        if target not in mesh.services:
+            return (f"Invalid target: {target}.", False)
+
+        svc = mesh.services[target]
+
+        # Extract drain percentage
+        drain_pct = parameters.get("drain_percentage", 0.80)
+        if not isinstance(drain_pct, (int, float)):
+            return (
+                f"Invalid drain_percentage: must be numeric. Got {type(drain_pct).__name__}.",
+                False,
+            )
+        drain_pct = float(drain_pct)
+
+        if drain_pct < TRAFFIC_SHIFT_MIN_DRAIN:
+            return (
+                f"drain_percentage too low ({drain_pct:.1%}). "
+                f"Minimum {TRAFFIC_SHIFT_MIN_DRAIN:.1%} required for observable effect.",
+                False,
+            )
+
+        clamped_note = ""
+        if drain_pct > TRAFFIC_SHIFT_MAX_DRAIN:
+            drain_pct = TRAFFIC_SHIFT_MAX_DRAIN
+            clamped_note = f" (clamped to {TRAFFIC_SHIFT_MAX_DRAIN:.1%} max)"
+
+        # wrong_action: draining a service below the degraded threshold
+        is_wrong = svc.http_server_error_rate < 0.10
+
+        # Mutations
+        original_active = svc.http_server_active_requests
+        svc.http_server_active_requests = int(original_active * (1.0 - drain_pct))
+
+        original_error_rate = svc.http_server_error_rate
+        svc.http_server_error_rate = round(original_error_rate * (1.0 - drain_pct), 4)
+
+        original_latency = svc.http_server_request_duration_p99
+        svc.http_server_request_duration_p99 = round(
+            original_latency * TRAFFIC_SHIFT_LATENCY_PENALTY, 4
+        )
+
+        feedback = (
+            f"Traffic shift applied to {target}:\n"
+            f"  Drain percentage:  {drain_pct:.1%}{clamped_note}\n"
+            f"  Active requests:   {original_active} → {svc.http_server_active_requests}"
+            f" ({-drain_pct * 100:.1f}%)\n"
+            f"  Error rate:        {original_error_rate:.3f} → {svc.http_server_error_rate:.3f}\n"
+            f"  P99 latency:       {original_latency * 1000:.0f}ms → "
+            f"{svc.http_server_request_duration_p99 * 1000:.0f}ms "
+            f"(+{(TRAFFIC_SHIFT_LATENCY_PENALTY - 1) * 100:.0f}% cross-zone penalty)\n"
+        )
+
+        if is_wrong:
+            feedback += (
+                "\n[WARNING] Service error rate was below healthy threshold (0.10). "
+                "Draining a healthy service wastes SLO budget."
+            )
+        else:
+            feedback += (
+                f"\n[Success] Blast radius contained. "
+                f"{drain_pct * 100:.0f}% of traffic rerouted to backup capacity. "
+                "Monitor for improvement."
+            )
+
+        return (feedback, is_wrong)
+
+    def _inspect_commit_diff(
+        self,
+        target: str,
+        mesh: "ServiceMesh",
+        fc: "FaultConfig",
+    ) -> tuple[str, bool]:
+        """
+        Simulates git diff for recent deployment.
+        Shows the code change that caused bad_deploy fault.
+        Confirms hypothesis before executing rollback.
+        """
+        if target not in mesh.services:
+            return (f"Invalid target: {target}.", False)
+
+        svc = mesh.services[target]
+
+        if (
+            target == fc.root_cause_service
+            and fc.fault_type == "bad_deploy"
+        ):
+            # Select diff template based on service metrics
+            if svc.http_server_error_rate > 0.70:
+                diff_key = "null_pointer"
+            elif svc.process_cpu_utilization > 0.85:
+                diff_key = "infinite_loop"
+            else:
+                diff_key = "timeout_removal"
+
+            diff_text = BAD_DEPLOY_DIFFS_TEMPLATES.get(diff_key, "No diff available.")
+
+            feedback = (
+                f"Git diff for {target} deployment (SHA: {svc.last_deployment_sha}):\n"
+                f"{diff_text}\n"
+                f"[Analysis] Deployment {svc.last_deployment_age_seconds}s ago introduced "
+                f"regression. Recommend rollback_deploy to previous stable version."
+            )
+        else:
+            feedback = (
+                f"Git diff for {target} (SHA: {svc.last_deployment_sha}):\n"
+                f"No anomalous changes detected in recent deployments.\n"
+                f"Last deploy: {svc.last_deployment_age_seconds}s ago (within normal range).\n"
+                f"[Analysis] Deployment is not the root cause. Consider other fault types."
+            )
+
+        return (feedback, False)
+
     # ------------------------------------------------------------------
     # Meta actions
     # ------------------------------------------------------------------
@@ -541,6 +998,24 @@ class ActionHandler:
     def is_circuit_broken(self, service_name: str) -> bool:
         """Check if a service has an active circuit breaker."""
         return service_name in self._circuit_breakers
+
+
+def _gc_rate_label(rate: float) -> str:
+    """Classify GC cycle rate into human-readable severity label."""
+    if rate > 30:
+        return "CRITICAL"
+    if rate > 10:
+        return "HIGH"
+    return "normal"
+
+
+def _gc_pause_label(pause_ms: float) -> str:
+    """Classify GC pause duration into human-readable severity label."""
+    if pause_ms > 500:
+        return "CRITICAL"
+    if pause_ms > 100:
+        return "elevated"
+    return "normal"
 
 
 # ==========================================================================

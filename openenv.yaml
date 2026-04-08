@@ -51,6 +51,7 @@ action_space:
     SRE diagnostic and remediation commands. Investigation actions reveal
     information without mutating state. Remediation actions mutate system state.
     System degrades autonomously each tick BEFORE the agent action is applied.
+    17 total actions: 10 original + 7 advanced diagnostic actions.
   properties:
     action_type:
       type: string
@@ -58,11 +59,18 @@ action_space:
         - fetch_logs
         - get_metrics_detail
         - trace_dependencies
+        - strace_process
+        - profiler_dump
+        - check_gc_pressure
+        - trace_distributed_request
+        - inspect_thread_pool
+        - inspect_commit_diff
         - restart_service
         - rollback_deploy
         - revert_config
         - scale_replicas
         - circuit_break
+        - traffic_shift
         - declare_resolved
         - escalate
     target_service:

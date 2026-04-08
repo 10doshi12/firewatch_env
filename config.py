@@ -274,6 +274,194 @@ TASKS: dict[str, TaskConfig] = {
 
 
 # ==========================================================================
+# Section 5 — Advanced Diagnostics Patterns (SPEC-9)
+# Source: Linux syscall behavior, profiler analysis, GC logs, JVM metrics
+# ==========================================================================
+
+# --- strace_process syscall frequency distributions ---
+# Keys: fault_type (+ "healthy"), Values: dict of syscall → frequency (0.0-1.0)
+# Source: strace output analysis, Brendan Gregg's perf tools
+SYSCALL_PATTERNS: dict[str, dict[str, float]] = {
+    "oom": {
+        "mmap": 0.65,       # Memory mapping (heap expansion)
+        "brk": 0.20,        # Break (heap boundary adjustment)
+        "read": 0.10,
+        "write": 0.05,
+    },
+    "memory_leak": {
+        "mmap": 0.45,       # Gradual heap growth
+        "brk": 0.15,
+        "munmap": 0.05,     # Failed to free (leak signature)
+        "read": 0.20,
+        "write": 0.15,
+    },
+    "config_drift": {
+        "accept": 0.40,     # EMFILE errors on socket accept
+        "epoll_wait": 0.35,
+        "close": 0.15,      # Trying to free file descriptors
+        "socket": 0.10,
+    },
+    "network_partition": {
+        "connect": 0.50,    # ECONNREFUSED errors
+        "sendto": 0.25,     # Failed packet sends
+        "recvfrom": 0.15,
+        "epoll_wait": 0.10,
+    },
+    "bad_deploy": {
+        "read": 0.30,       # Normal I/O pattern
+        "write": 0.25,
+        "epoll_wait": 0.25,
+        "futex": 0.20,      # Lock contention (infinite loop may cause)
+    },
+    "healthy": {
+        "epoll_wait": 0.50, # Mostly waiting on network events
+        "read": 0.20,
+        "write": 0.15,
+        "accept": 0.10,
+        "close": 0.05,
+    },
+}
+
+# --- profiler_dump CPU categorization ---
+# Keys: fault_type (+ "healthy"), Values: dict of category → fraction (0.0-1.0)
+# Categories: user_code_cpu, io_wait, gc, kernel
+# Source: pprof/py-spy flame graph analysis
+PROFILE_PATTERNS: dict[str, dict[str, float]] = {
+    "bad_deploy": {
+        "user_code_cpu": 0.85,  # Infinite loop or hot regex
+        "io_wait": 0.05,
+        "gc": 0.05,
+        "kernel": 0.05,
+    },
+    "network_partition": {
+        "user_code_cpu": 0.05,
+        "io_wait": 0.90,        # Blocked on socket read/write
+        "gc": 0.03,
+        "kernel": 0.02,
+    },
+    "memory_leak": {
+        "user_code_cpu": 0.30,
+        "io_wait": 0.15,
+        "gc": 0.50,             # GC thrashing
+        "kernel": 0.05,
+    },
+    "oom": {
+        "user_code_cpu": 0.25,
+        "io_wait": 0.20,
+        "gc": 0.50,             # Pre-kill GC desperation
+        "kernel": 0.05,
+    },
+    "config_drift": {
+        "user_code_cpu": 0.10,
+        "io_wait": 0.80,        # Waiting on connection pool
+        "gc": 0.05,
+        "kernel": 0.05,
+    },
+    "healthy": {
+        "user_code_cpu": 0.40,  # Balanced profile
+        "io_wait": 0.35,
+        "gc": 0.15,
+        "kernel": 0.10,
+    },
+}
+
+# --- check_gc_pressure GC metrics per fault type ---
+# Source: JVM GC logs, Python gc.get_stats(), Go GODEBUG
+GC_PRESSURE_PATTERNS: dict[str, dict[str, float]] = {
+    "memory_leak": {
+        "gc_cycles_per_second": 45.0,   # Thrashing
+        "gc_pause_time_ms": 850.0,      # Stop-the-world
+        "heap_after_gc_mb": 480.0,      # Not reclaiming
+        "gc_cpu_percent": 65.0,         # 65% of CPU in GC
+    },
+    "oom": {
+        "gc_cycles_per_second": 120.0,  # Desperate pre-kill
+        "gc_pause_time_ms": 1200.0,
+        "heap_after_gc_mb": 510.0,      # Out of headroom
+        "gc_cpu_percent": 85.0,
+    },
+    "healthy": {
+        "gc_cycles_per_second": 2.0,
+        "gc_pause_time_ms": 15.0,
+        "heap_after_gc_mb": 180.0,
+        "gc_cpu_percent": 5.0,
+    },
+}
+
+# --- inspect_thread_pool saturation levels ---
+# Source: JVM ThreadPoolExecutor, Gunicorn workers, Tomcat threads
+THREAD_POOL_PATTERNS: dict[str, dict[str, int]] = {
+    "saturated": {
+        "active_threads": 200,
+        "max_threads": 200,
+        "queued_requests": 1500,
+        "avg_queue_time_ms": 3400,
+    },
+    "high_load": {
+        "active_threads": 180,
+        "max_threads": 200,
+        "queued_requests": 250,
+        "avg_queue_time_ms": 450,
+    },
+    "healthy": {
+        "active_threads": 50,
+        "max_threads": 200,
+        "queued_requests": 5,
+        "avg_queue_time_ms": 12,
+    },
+}
+
+# --- inspect_commit_diff git diff templates ---
+# Keys: diff subtype, Values: simulated diff text
+# Source: Common bad deploy patterns from postmortems
+BAD_DEPLOY_DIFFS_TEMPLATES: dict[str, str] = {
+    "timeout_removal": (
+        "--- a/src/PaymentService.java\n"
+        "+++ b/src/PaymentService.java\n"
+        "@@ -45,7 +45,7 @@\n"
+        "     private void processPayment(Order order) {\n"
+        "-        httpClient.setTimeout(3000);  // 3 second timeout\n"
+        "+        httpClient.setTimeout(null);   // OOPS: removed timeout\n"
+        "         Response resp = httpClient.post(\"/charge\", order);\n"
+    ),
+    "null_pointer": (
+        "--- a/src/AuthService.java\n"
+        "+++ b/src/AuthService.java\n"
+        "@@ -123,8 +123,7 @@\n"
+        "     public User authenticate(String token) {\n"
+        "         User user = validateToken(token);\n"
+        "-        if (user != null) {\n"
+        "-            return enrichUserProfile(user);\n"
+        "-        }\n"
+        "+        return enrichUserProfile(user);  // NPE if token invalid\n"
+    ),
+    "infinite_loop": (
+        "--- a/src/OrderProcessor.java\n"
+        "+++ b/src/OrderProcessor.java\n"
+        "@@ -89,7 +89,7 @@\n"
+        "     private void retryFailedOrders() {\n"
+        "-        for (int i = 0; i < pendingOrders.size(); i++) {\n"
+        "+        while (true) {  // OOPS: infinite loop\n"
+        "             processOrder(pendingOrders.get(i));\n"
+    ),
+    "config_typo": (
+        "--- a/config/application.yml\n"
+        "+++ b/config/application.yml\n"
+        "@@ -12,7 +12,7 @@\n"
+        "   datasource:\n"
+        "-    pool-size: 50\n"
+        "+    pool-size: 5  # Typo: reduced from 50 to 5\n"
+    ),
+}
+
+# --- traffic_shift parameters ---
+# Source: Kubernetes draining, Istio VirtualService weights, AWS ELB
+TRAFFIC_SHIFT_LATENCY_PENALTY: float = 1.15   # 15% latency increase for cross-zone routing
+TRAFFIC_SHIFT_MIN_DRAIN: float = 0.50          # Minimum 50% drain for observable effect
+TRAFFIC_SHIFT_MAX_DRAIN: float = 0.95          # Max 95% (keep 5% for health checks)
+
+
+# ==========================================================================
 # Public API
 # ==========================================================================
 
@@ -326,4 +514,12 @@ __all__ = [
     "BCM_LATENCY_WEIGHT",
     "TaskConfig",
     "TASKS",
+    "SYSCALL_PATTERNS",
+    "PROFILE_PATTERNS",
+    "GC_PRESSURE_PATTERNS",
+    "THREAD_POOL_PATTERNS",
+    "BAD_DEPLOY_DIFFS_TEMPLATES",
+    "TRAFFIC_SHIFT_LATENCY_PENALTY",
+    "TRAFFIC_SHIFT_MIN_DRAIN",
+    "TRAFFIC_SHIFT_MAX_DRAIN",
 ]

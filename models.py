@@ -71,12 +71,21 @@ ActionType = Literal[
     "fetch_logs",
     "get_metrics_detail",
     "trace_dependencies",
+    # Advanced diagnostic investigation actions (SPEC-9)
+    "strace_process",
+    "profiler_dump",
+    "check_gc_pressure",
+    "trace_distributed_request",
+    "inspect_thread_pool",
+    "inspect_commit_diff",
     # Remediation actions — mutate system state
     "restart_service",
     "rollback_deploy",
     "revert_config",
     "scale_replicas",
     "circuit_break",
+    # Advanced remediation actions (SPEC-9)
+    "traffic_shift",
     # Meta actions — episode control
     "declare_resolved",
     "escalate",
@@ -150,6 +159,46 @@ class ServiceMetrics(BaseModel):
     process_open_file_descriptors: int = Field(
         default=120,
         description="OTel: process.open_file_descriptor.count. High = connection exhaustion.",
+    )
+
+    # --- Runtime performance metrics (JVM/V8/Go runtime) ---
+    runtime_gc_pause_duration_ms: float = Field(
+        default=15.0,
+        description=(
+            "OTel: runtime.{language}.gc.pause.duration. "
+            "Unit: milliseconds. Stop-the-world GC pause time. "
+            "Healthy: <50ms. Critical: >500ms."
+        ),
+    )
+    runtime_gc_count_per_second: float = Field(
+        default=2.0,
+        description=(
+            "OTel: runtime.{language}.gc.count (rate). "
+            "Unit: {gc}/s. GC cycles per second. "
+            "Healthy: <5. Thrashing: >30."
+        ),
+    )
+    runtime_jvm_threads_count: int = Field(
+        default=50,
+        description=(
+            "OTel: runtime.jvm.threads.count. "
+            "Unit: {thread}. Active threads. "
+            "Saturated when == max_threads."
+        ),
+    )
+    runtime_jvm_threads_max: int = Field(
+        default=200,
+        description=(
+            "OTel: Configured max thread pool size. "
+            "Saturation = threads_count >= threads_max."
+        ),
+    )
+    runtime_thread_pool_queue_depth: int = Field(
+        default=0,
+        description=(
+            "OTel-adjacent: Pending requests in thread pool queue. "
+            "High value = backpressure, head-of-line blocking."
+        ),
     )
 
     # --- Runtime / deployment metadata ---
