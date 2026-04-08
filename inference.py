@@ -287,7 +287,8 @@ SYSTEM_PROMPT = textwrap.dedent("""
     3. Apply ONE remediation (restart / rollback / revert_config) on the root cause
     4. If error_rate drops after remediation, the fix is working — wait 1-2 ticks then declare_resolved
     5. If no improvement after 2 tries, try a different remediation or different target service
-    6. declare_resolved ONLY when ALL services show error_rate < 0.05
+    6. declare_resolved when root cause AND cascade services have recovered (error_rate < 0.10)
+       NOTE: Some services may have small baseline error rates (0.05-0.09) — these are NOT faults and don't need fixing
 
     AFTER SUCCESSFUL REMEDIATION:
     - If you applied a fix and rewards improved (less negative), the fix is working
@@ -296,8 +297,8 @@ SYSTEM_PROMPT = textwrap.dedent("""
     - System recovers automatically after correct remediation — you don't need to do anything extra
 
     FORBIDDEN:
-    - declare_resolved if ANY service has error_rate >= 0.05 (incurs heavy penalty)
     - Remediating a service with error_rate < 0.05 (wrong-action penalty -0.5)
+    - Trying to fix services with small baseline error rates (0.05-0.09) that were never degraded
     - Repeating the exact same action on the same service more than 2 times in a row
     - Endlessly investigating a service after already remediating it — declare when recovered
 
@@ -492,7 +493,13 @@ def rule_based_action(obs: dict, step: int, state: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def _recovery_hint(obs: dict, history: list) -> str:
-    """Generate a decision hint based on current system state and history."""
+    """Generate a decision hint based on current system state and history.
+
+    Key design: the 'all healthy — declare NOW' hint only fires AFTER a
+    remediation action has been applied.  Early-stage faults may have
+    error_rate < 0.10 at tick 1, and telling the model to declare at that
+    point causes instant premature exit (score ≈ 0.24).
+    """
     services = obs.get("services", {})
     if not services:
         return "No services found. Call declare_resolved."
@@ -501,30 +508,48 @@ def _recovery_hint(obs: dict, history: list) -> str:
         (m.get("http_server_error_rate", 0) for m in services.values()),
         default=0,
     )
+    # Use 0.10 threshold — red herring services sit at 0.05-0.09 permanently
+    # and don't need fixing. Only services above 0.10 are genuinely fault-affected.
     degraded = [
         name for name, m in services.items()
-        if m.get("http_server_error_rate", 0) >= 0.05
+        if m.get("http_server_error_rate", 0) >= 0.10
     ]
 
-    # All healthy → declare immediately
-    if max_err < 0.05:
+    # Check if ANY remediation has ever been applied in the full history
+    remediation_types = {"restart_service", "rollback_deploy", "revert_config",
+                         "scale_replicas", "circuit_break", "traffic_shift"}
+    has_remediated = any(
+        any(rt in str(h) for rt in remediation_types)
+        for h in history
+    )
+
+    # No remediation yet → MUST investigate first, never declare
+    if not has_remediated:
+        if degraded:
+            return (
+                f"⚡ INCIDENT ACTIVE — {len(degraded)} service(s) degraded (>0.10): "
+                f"{', '.join(degraded[:3])}. "
+                "Investigate with fetch_logs and trace_dependencies, then apply a remediation."
+            )
+        # All services < 0.10 but no remediation applied yet → still need to investigate
+        # (early-stage faults may not have crossed 0.10 after just 1 tick)
         return (
-            "✅ ALL services have error_rate < 0.05. System is HEALTHY. "
+            "⚡ INCIDENT DETECTED — error rates are still low but a fault has been injected. "
+            "Start investigating: fetch_logs on the service with the highest error_rate, "
+            "then trace_dependencies to find the root cause."
+        )
+
+    # --- Remediation has been applied ---
+
+    # No service above 0.10 → safe to declare
+    if max_err < 0.10:
+        return (
+            "✅ ALL services have recovered (error_rate < 0.10). System is HEALTHY. "
             "You MUST call declare_resolved NOW."
         )
 
-    # Check if we just applied a remediation in the last 3 steps
-    recent = history[-3:] if history else []
-    remediation_types = {"restart_service", "rollback_deploy", "revert_config",
-                         "scale_replicas", "circuit_break", "traffic_shift"}
-    recent_remediation = any(
-        any(rt in str(h) for rt in remediation_types)
-        for h in recent
-    )
-
     # Check for repetitive investigation on same target
     if len(history) >= 3:
-        # Extract just the action part: "Step N [src]: action_str → ..."
         def _extract_action(h: str) -> str:
             s = str(h)
             if ": " in s and " →" in s:
@@ -537,7 +562,14 @@ def _recovery_hint(obs: dict, history: list) -> str:
                 "Either try a DIFFERENT service, a DIFFERENT action, or declare_resolved."
             )
 
-    if recent_remediation and max_err < 0.10:
+    # Check if remediation was recent (last 3 steps)
+    recent = history[-3:] if history else []
+    recent_remediation = any(
+        any(rt in str(h) for rt in remediation_types)
+        for h in recent
+    )
+
+    if recent_remediation and max_err < 0.15:
         return (
             f"System is RECOVERING (max error_rate={max_err:.2f}). "
             "Remediation was applied recently. Recovery is automatic. "
@@ -546,12 +578,15 @@ def _recovery_hint(obs: dict, history: list) -> str:
 
     if degraded:
         return (
-            f"{len(degraded)} service(s) still degraded: {', '.join(degraded[:3])}. "
-            "Investigate or remediate them. "
-            "Only call declare_resolved when ALL services show error_rate < 0.05."
+            f"{len(degraded)} service(s) still degraded (>0.10): {', '.join(degraded[:3])}. "
+            "Your previous remediation may not have fixed the root cause. "
+            "Try a different action or a different target service."
         )
 
-    return "Monitor and declare_resolved when all services are healthy."
+    # Remediated, no service above 0.10 — shouldn't reach here, but safe fallback
+    return (
+        "System appears stable. Call declare_resolved to finish the episode."
+    )
 
 
 def build_user_prompt(obs: dict, step: int, history: list, state: dict | None = None) -> str:
@@ -794,6 +829,9 @@ def run_task(client: Optional[OpenAI], task_id: str, difficulty: str,
             except Exception:
                 pass
 
+    except KeyboardInterrupt:
+        # Ctrl+C: return whatever we have so far
+        pass
     except Exception:
         pass
 
@@ -814,7 +852,14 @@ def main() -> None:
         ("task_hard",   "hard",   256, 40),
     ]
 
+    interrupted = False
     for task_id, difficulty, seed, max_ticks in tasks:
+        if interrupted:
+            # Emit zero-score END for skipped tasks so output format stays valid
+            log_start(task=task_id, env="firewatch-env", model=MODEL_NAME)
+            log_end(success=False, steps=0, score=0.0, rewards=[])
+            continue
+
         score   = 0.0
         steps   = 0
         rewards = []
@@ -824,6 +869,8 @@ def main() -> None:
             score, steps, rewards = run_task(client, task_id, difficulty,
                                               seed, max_ticks)
             success = score >= SUCCESS_SCORE_THRESHOLD
+        except KeyboardInterrupt:
+            interrupted = True
         except Exception:
             pass
         finally:
