@@ -205,7 +205,7 @@ All tasks are seeded deterministically for reproducibility. Red herring services
 |---|---|---|---|---|---|---|
 | `task_easy` | Easy | 3 | 0 | 20 | 1.5% | 42 |
 | `task_medium` | Medium | 5 | 1 | 30 | 2.5% | 137 |
-| `task_hard` | Hard | 7 | 3 (1 adversarial) | 40 | 4.0% | 256 |
+| `task_hard` | Hard | 7 | 3 (1 adversarial) | 40 | 3.0% | 256 |
 
 ### Task 1 — Easy: Single Service OOM
 
