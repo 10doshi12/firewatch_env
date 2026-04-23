@@ -18,7 +18,7 @@ import uuid
 from dataclasses import dataclass, field
 
 try:
-    from .models import ServiceMetrics, derive_status
+    from .models import ServiceMetrics, FaultState, derive_status
     from .config import (
         ALL_SERVICES,
         FULL_DEPENDENCY_GRAPH,
@@ -49,7 +49,7 @@ try:
         TASKS,
     )
 except ImportError:
-    from models import ServiceMetrics, derive_status
+    from models import ServiceMetrics, FaultState, derive_status
     from config import (
         ALL_SERVICES,
         FULL_DEPENDENCY_GRAPH,
@@ -269,12 +269,13 @@ class ServiceMesh:
     at a time via tick(). No OpenEnv imports. No action handling (that's
     ActionHandler in actions.py).
 
-    tick() order:
-      1. Apply fault physics to root cause service
-      2. Propagate cascade downstream
-      3. Update status on all services via derive_status()
-      4. Advance tick counter + simulated time
-      5. Update BCM + check MTTM
+    SPEC-01 §6 tick() order:
+      1. For each non-halted FaultState: apply fault physics
+      2. Cascade from ALL non-halted fault services (additive)
+      3. Recovery physics for halted faults
+      4. Update status on all services via derive_status()
+      5. Advance tick counter + simulated time
+      6. Update BCM + check MTTM
     """
 
     def __init__(
@@ -295,8 +296,16 @@ class ServiceMesh:
         self.slo_burn_rate: float = SLO_BURN_RATE_BY_DIFFICULTY[difficulty]
         self.incident_metrics = IncidentMetrics()
 
-        # Track whether fault has been remediated (used by actions.py later)
+        # SPEC-01 §1: Multi-fault support via List[FaultState]
+        # Populated by generate_episode() after construction.
+        self.active_faults: list[FaultState] = []
+
+        # Backward-compat shim: actions.py sets this for single-fault tasks.
+        # For multi-fault, actions.py should iterate active_faults directly.
         self.fault_halted: bool = False
+
+        # SPEC-01 §5: Adversarial log injection entries
+        self._adversarial_logs: list[dict] = []
 
         # Build reverse dependency map: service → list of services that depend on it
         self._reverse_deps: dict[str, list[str]] = {svc: [] for svc in services}
@@ -307,21 +316,35 @@ class ServiceMesh:
 
     def tick(self) -> float:
         """
-        Advance simulation by one step.
+        Advance simulation by one step. SPEC-01 §6 multi-fault loop.
 
         Returns:
             bcm_delta for this tick (used by reward engine).
         """
-        # 1. Apply fault physics to root cause (unless remediated)
-        if not self.fault_halted:
-            self._apply_fault_physics()
+        if self.active_faults:
+            # SPEC-01 §6: Multi-fault tick loop
+            # 1. Apply fault physics to each non-halted fault
+            for fault in self.active_faults:
+                if not fault.halted:
+                    self._apply_fault_physics_for(fault)
+                    fault.progression_tick += 1
+
+            # 2. Cascade from ALL non-halted fault services (additive)
+            self._propagate_cascade()
+
+            # 3. Recovery physics for halted faults
+            for fault in self.active_faults:
+                if fault.halted:
+                    self._apply_recovery_physics_for(fault)
         else:
-            self._apply_recovery_physics()
+            # Legacy single-fault path (backward compat)
+            if not self.fault_halted:
+                self._apply_fault_physics()
+            else:
+                self._apply_recovery_physics()
+            self._propagate_cascade()
 
-        # 2. Propagate cascade downstream
-        self._propagate_cascade()
-
-        # 3. Update status on all services
+        # 4. Update status on all services
         for svc_name, metrics in self.services.items():
             metrics.status = derive_status(
                 metrics.http_server_error_rate,
@@ -329,7 +352,7 @@ class ServiceMesh:
                 metrics.process_memory_utilization,
             )
 
-        # 4. Advance counters
+        # 5. Advance counters
         self.tick_count += 1
         self.sim_time_seconds += SECONDS_PER_TICK
 
@@ -337,7 +360,7 @@ class ServiceMesh:
         for metrics in self.services.values():
             metrics.runtime_uptime_seconds += SECONDS_PER_TICK
 
-        # 5. Calculate BCM and update SLO
+        # 6. Calculate BCM and update SLO
         bcm_delta = self._calculate_bcm_delta()
         self.incident_metrics.update(bcm_delta, self.tick_count)
 
@@ -413,6 +436,66 @@ class ServiceMesh:
             if name in fc.red_herring_services:
                 continue  # Red herrings keep static degradation (intentional)
             # 0.10/tick downstream recovery — slightly slower than root cause
+            if metrics.http_server_error_rate > 0.02:
+                metrics.http_server_error_rate = max(
+                    0.01, metrics.http_server_error_rate - speed * 0.10
+                )
+            if metrics.http_server_request_duration_p99 > 0.15:
+                metrics.http_server_request_duration_p99 = max(
+                    0.1, metrics.http_server_request_duration_p99 - speed * 1.0
+                )
+
+    # ------------------------------------------------------------------
+    # SPEC-01 §6: Multi-fault aware physics methods
+    # ------------------------------------------------------------------
+
+    def _apply_fault_physics_for(self, fault: FaultState) -> None:
+        """Apply fault-specific degradation for one FaultState."""
+        svc = self.services.get(fault.fault_service)
+        if svc is None:
+            return
+
+        speed = fault.fault_speed
+
+        if fault.fault_type == "oom":
+            self._apply_oom(svc, speed)
+        elif fault.fault_type == "memory_leak":
+            self._apply_memory_leak(svc, speed)
+        elif fault.fault_type == "bad_deploy":
+            self._apply_bad_deploy(svc, speed)
+        elif fault.fault_type == "config_drift":
+            self._apply_config_drift(svc, speed)
+        elif fault.fault_type == "network_partition":
+            self._apply_network_partition(svc, speed)
+
+    def _apply_recovery_physics_for(self, fault: FaultState) -> None:
+        """Gradually recover metrics for one halted FaultState.
+
+        Recovers both the fault's service and downstream cascade victims.
+        """
+        svc = self.services.get(fault.fault_service)
+        speed = fault.fault_speed
+
+        if svc is not None:
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate - speed * 0.15)
+
+            target_lat = 0.1
+            current_lat = svc.http_server_request_duration_p99
+            if current_lat > target_lat:
+                svc.http_server_request_duration_p99 = max(target_lat, current_lat - speed * 1.5)
+
+            if fault.fault_type in ("oom", "memory_leak") and svc.process_memory_utilization > 0.40:
+                svc.process_memory_utilization = max(0.25, svc.process_memory_utilization - speed * 0.10)
+                svc.process_memory_usage_bytes = int(
+                    svc.process_memory_utilization * svc.process_memory_limit_bytes
+                )
+
+        # Recover downstream cascade victims
+        for name, metrics in self.services.items():
+            if name == fault.fault_service:
+                continue
+            if name in self.fault_config.red_herring_services:
+                continue
             if metrics.http_server_error_rate > 0.02:
                 metrics.http_server_error_rate = max(
                     0.01, metrics.http_server_error_rate - speed * 0.10
@@ -522,54 +605,65 @@ class ServiceMesh:
         )
 
     def _propagate_cascade(self) -> None:
-        """Propagate degradation downstream through the dependency graph."""
-        root = self.fault_config.root_cause_service
-        root_metrics = self.services.get(root)
-        if root_metrics is None:
-            return
+        """Propagate degradation downstream through the dependency graph.
 
-        if root_metrics.http_server_error_rate < CASCADE_ERROR_THRESHOLD:
-            return
+        SPEC-01 §6: Cascade from every non-halted fault service.
+        Effects at shared victims are additive, capped at 1.0.
+        """
+        # Collect all fault sources to cascade from
+        fault_sources: list[str] = []
+        if self.active_faults:
+            for fault in self.active_faults:
+                if not fault.halted:
+                    fault_sources.append(fault.fault_service)
+        else:
+            # Legacy single-fault path
+            fault_sources = [self.fault_config.root_cause_service]
 
-        # BFS cascade propagation from root cause
-        visited: set[str] = {root}
-        # (service_name, error_contribution, depth)
-        queue: list[tuple[str, float, int]] = []
-
-        # Find services that DEPEND ON root (i.e., root is their dependency)
-        initial_contribution = root_metrics.http_server_error_rate * CASCADE_DOWNSTREAM_FACTOR
-        for downstream in self._reverse_deps.get(root, []):
-            if downstream not in visited:
-                queue.append((downstream, initial_contribution, 1))
-                visited.add(downstream)
-
-        while queue:
-            svc_name, error_contrib, depth = queue.pop(0)
-
-            if depth > CASCADE_MAX_DEPTH or error_contrib < 0.01:
+        for source in fault_sources:
+            source_metrics = self.services.get(source)
+            if source_metrics is None:
+                continue
+            if source_metrics.http_server_error_rate < CASCADE_ERROR_THRESHOLD:
                 continue
 
-            svc = self.services.get(svc_name)
-            if svc is None:
-                continue
+            # BFS cascade propagation from this fault source
+            visited: set[str] = {source}
+            queue: list[tuple[str, float, int]] = []
 
-            # Skip red herring services — they have static degradation
-            if svc_name in self.fault_config.red_herring_services:
-                continue
+            initial_contribution = source_metrics.http_server_error_rate * CASCADE_DOWNSTREAM_FACTOR
+            for downstream in self._reverse_deps.get(source, []):
+                if downstream not in visited:
+                    queue.append((downstream, initial_contribution, 1))
+                    visited.add(downstream)
 
-            # Apply cascade error contribution (additive, capped at 1.0)
-            svc.http_server_error_rate = min(
-                1.0, svc.http_server_error_rate + error_contrib
-            )
-            # Cascade also adds some latency
-            svc.http_server_request_duration_p99 += error_contrib * 0.5
+            while queue:
+                svc_name, error_contrib, depth = queue.pop(0)
 
-            # Propagate further downstream with attenuation
-            next_contrib = error_contrib * CASCADE_ATTENUATION_FACTOR
-            for further_downstream in self._reverse_deps.get(svc_name, []):
-                if further_downstream not in visited:
-                    queue.append((further_downstream, next_contrib, depth + 1))
-                    visited.add(further_downstream)
+                if depth > CASCADE_MAX_DEPTH or error_contrib < 0.01:
+                    continue
+
+                svc = self.services.get(svc_name)
+                if svc is None:
+                    continue
+
+                # Skip red herring services — they have static degradation
+                if svc_name in self.fault_config.red_herring_services:
+                    continue
+
+                # Apply cascade error contribution (additive, capped at 1.0)
+                svc.http_server_error_rate = min(
+                    1.0, svc.http_server_error_rate + error_contrib
+                )
+                # Cascade also adds some latency
+                svc.http_server_request_duration_p99 += error_contrib * 0.5
+
+                # Propagate further downstream with attenuation
+                next_contrib = error_contrib * CASCADE_ATTENUATION_FACTOR
+                for further_downstream in self._reverse_deps.get(svc_name, []):
+                    if further_downstream not in visited:
+                        queue.append((further_downstream, next_contrib, depth + 1))
+                        visited.add(further_downstream)
 
     def _calculate_bcm_delta(self) -> float:
         """
@@ -614,7 +708,16 @@ class ServiceMesh:
             if generator:
                 return generator(service_name, metrics)
 
-        # Prompt injection service
+        # SPEC-01 §5: Adversarial log injection (list-based)
+        if self._adversarial_logs:
+            for adv in self._adversarial_logs:
+                if adv.get("service") == service_name:
+                    logs = _generate_healthy_logs(service_name)
+                    insert_pos = len(logs) // 2
+                    logs.insert(insert_pos, adv["line"])
+                    return logs
+
+        # Legacy prompt injection service (backward compat)
         if service_name == fc.prompt_injection_service:
             return _generate_prompt_injection_logs(
                 service_name, fc.root_cause_service
@@ -805,6 +908,50 @@ def generate_episode(
         difficulty=difficulty,
     )
 
+    # --- SPEC-01 §1: Build FaultState list ---
+    primary_fault = FaultState(
+        fault_type=fault_type,
+        fault_service=root_cause,
+        fault_speed=deg_speed,
+    )
+    active_faults = [primary_fault]
+
+    # Dual-fault support: if TaskConfig has secondary fault, add it
+    if task and task.secondary_fault_type:
+        secondary_fault = FaultState(
+            fault_type=task.secondary_fault_type,
+            fault_service=task.secondary_fault_service or root_cause,
+            fault_speed=task.secondary_fault_speed,
+        )
+        active_faults.append(secondary_fault)
+
+    mesh.active_faults = active_faults
+
+    # --- SPEC-01 §3: Direct state injection ---
+    for fs in active_faults:
+        if fs.initial_state:
+            svc = mesh.services.get(fs.fault_service)
+            if svc is not None:
+                for field_name, value in fs.initial_state.items():
+                    setattr(svc, field_name, value)
+                svc.status = derive_status(
+                    svc.http_server_error_rate,
+                    svc.http_server_request_duration_p99,
+                    svc.process_memory_utilization,
+                )
+
+    # --- SPEC-01 §4: Task-scoped metrics attachment ---
+    if task and task.task_metrics_schema:
+        for svc_name, fields in task.task_metrics_schema.items():
+            svc = mesh.services.get(svc_name)
+            if svc is not None:
+                for field_name, default_value in fields.items():
+                    setattr(svc, field_name, default_value)
+
+    # --- SPEC-01 §5: Adversarial log injection ---
+    if task and task.adversarial_logs:
+        mesh._adversarial_logs = list(task.adversarial_logs)
+
     return mesh, fault_config
 
 
@@ -812,14 +959,20 @@ def _count_blast_radius(mesh: "ServiceMesh", fault_config: "FaultConfig") -> int
     """
     Count services that will be affected by this fault at full cascade propagation.
 
-    Uses BFS through the dependency graph from root cause service.
+    Uses BFS through the dependency graph from ALL fault sources.
     Used as static denominator in grade() to prevent tick-0 exploit.
 
     Returns:
-        max(1, number of services reachable from root cause within CASCADE_MAX_DEPTH hops)
+        max(1, number of services reachable from fault sources within CASCADE_MAX_DEPTH hops)
     """
-    affected: set[str] = {fault_config.root_cause_service}
-    frontier: list[str] = [fault_config.root_cause_service]
+    # Start from all fault sources
+    roots: set[str] = {fault_config.root_cause_service}
+    if mesh.active_faults:
+        for fault in mesh.active_faults:
+            roots.add(fault.fault_service)
+
+    affected: set[str] = set(roots)
+    frontier: list[str] = list(roots)
     for _ in range(CASCADE_MAX_DEPTH):
         next_frontier: list[str] = []
         for svc in frontier:

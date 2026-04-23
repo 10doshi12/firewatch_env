@@ -12,7 +12,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 # ==========================================================================
@@ -245,6 +245,66 @@ INVESTIGATION_ACTIONS: frozenset[str] = frozenset({
     "inspect_commit_diff",
 })
 
+
+# ==========================================================================
+# Section 3b — Action Registry (SPEC-02)
+# ==========================================================================
+# Every action definition includes:
+#   - category: "Investigation", "Remediation", or "Meta"
+#   - guard_applies: bool | None
+#     Only meaningful for Remediation actions. True = the wrong-action guard
+#     checks error_rate before allowing the action. False = guard is skipped
+#     (reserved for Phase 2/3 actions that target non-error-rate metrics).
+#     None for non-Remediation actions (Investigation + Meta).
+
+@dataclass(frozen=True)
+class ActionDef:
+    """Definition of a single action in the registry."""
+    category: str                        # "Investigation", "Remediation", or "Meta"
+    guard_applies: bool | None = None    # Only set for Remediation actions
+
+
+ACTION_REGISTRY: dict[str, ActionDef] = {
+    # --- Investigation actions (guard never applies) ---
+    "fetch_logs":                ActionDef(category="Investigation"),
+    "get_metrics_detail":        ActionDef(category="Investigation"),
+    "trace_dependencies":        ActionDef(category="Investigation"),
+    "strace_process":            ActionDef(category="Investigation"),
+    "profiler_dump":             ActionDef(category="Investigation"),
+    "check_gc_pressure":         ActionDef(category="Investigation"),
+    "trace_distributed_request": ActionDef(category="Investigation"),
+    "inspect_thread_pool":       ActionDef(category="Investigation"),
+    "inspect_commit_diff":       ActionDef(category="Investigation"),
+    # --- Remediation actions (guard_applies=True for all Phase 1) ---
+    "restart_service":           ActionDef(category="Remediation", guard_applies=True),
+    "rollback_deploy":           ActionDef(category="Remediation", guard_applies=True),
+    "revert_config":             ActionDef(category="Remediation", guard_applies=True),
+    "scale_replicas":            ActionDef(category="Remediation", guard_applies=True),
+    "circuit_break":             ActionDef(category="Remediation", guard_applies=True),
+    "traffic_shift":             ActionDef(category="Remediation", guard_applies=True),
+    # --- Meta actions (guard never applies) ---
+    "declare_resolved":          ActionDef(category="Meta"),
+    "escalate":                  ActionDef(category="Meta"),
+}
+
+# --- Action Registry Validation (SPEC-02 §5) ---
+# Assert at import time:
+#   1. Every Remediation action has an explicit guard_applies (True or False).
+#   2. Every non-Remediation action has guard_applies == None.
+for _action_name, _action_def in ACTION_REGISTRY.items():
+    if _action_def.category == "Remediation":
+        assert _action_def.guard_applies is not None, (
+            f"ACTION_REGISTRY validation failed: Remediation action '{_action_name}' "
+            f"must have an explicit guard_applies (True or False), got None."
+        )
+    else:
+        assert _action_def.guard_applies is None, (
+            f"ACTION_REGISTRY validation failed: {_action_def.category} action "
+            f"'{_action_name}' must not have guard_applies set (expected None, "
+            f"got {_action_def.guard_applies})."
+        )
+
+
 # --- Grader Weights ---
 # No published canonical grader for SRE RL environments exists. These are
 # defended on decision-theoretic grounds:
@@ -330,17 +390,48 @@ BCM_LATENCY_NORMALIZED_MAX: float = 2.0
 
 @dataclass(frozen=True)
 class TaskConfig:
-    """Configuration for one evaluation task. Immutable."""
+    """Configuration for one evaluation task. Immutable.
+
+    Extended for SPEC-01 §2 with fault specification, dual-fault support,
+    adversarial log injection, and task-scoped metrics schema.
+
+    initial_budget must always equal max_ticks × slo_burn_rate.
+    """
 
     task_id: str
     name: str
     difficulty: str
     description: str
-    num_services: int
-    num_red_herrings: int
-    max_ticks: int
-    grader_seed: int
-    max_bad_customer_minutes: float
+    fault_type: str
+    fault_service: str
+    seed: int
+    services: tuple[str, ...] = ()      # canonical services for this task (frozen tuple)
+    fault_speed: float = 1.0
+    red_herrings: tuple[str, ...] = ()   # services initialized in [0.05, 0.09] error range
+    num_services: int = 3
+    num_red_herrings: int = 0
+    max_ticks: int = 20
+    slo_burn_rate: float = 1.5
+    initial_budget: float = 30.0         # = max_ticks × slo_burn_rate always
+    grader_seed: int = 42
+    max_bad_customer_minutes: float = 100.0
+    adversarial_logs: tuple[dict, ...] | None = None  # list of {"service": str, "line": str}
+    task_metrics_schema: dict = field(default_factory=dict)  # {service_name: {field: default}}
+
+    # Dual-fault only (None for single-fault tasks)
+    secondary_fault_type: str | None = None
+    secondary_fault_service: str | None = None
+    secondary_fault_speed: float = 1.0
+
+    def __post_init__(self) -> None:
+        """Validate initial_budget = max_ticks × slo_burn_rate."""
+        expected = self.max_ticks * self.slo_burn_rate
+        if abs(self.initial_budget - expected) > 0.01:
+            raise ValueError(
+                f"initial_budget ({self.initial_budget}) must equal "
+                f"max_ticks ({self.max_ticks}) × slo_burn_rate ({self.slo_burn_rate}) "
+                f"= {expected}"
+            )
 
 
 TASKS: dict[str, TaskConfig] = {
@@ -348,6 +439,9 @@ TASKS: dict[str, TaskConfig] = {
         task_id="task_easy",
         name="Single Service OOM",
         difficulty="easy",
+        fault_type="oom",
+        fault_service="",  # determined by generate_episode() seed
+        seed=42,
         description=(
             "3 services, 0 red herrings, 20 tick budget. Single OOM fault on a "
             "leaf service. Clear log signature. Tests the fundamental "
@@ -356,6 +450,8 @@ TASKS: dict[str, TaskConfig] = {
         num_services=3,
         num_red_herrings=0,
         max_ticks=20,
+        slo_burn_rate=1.5,
+        initial_budget=30.0,
         grader_seed=42,
         max_bad_customer_minutes=100.0,
     ),
@@ -363,6 +459,9 @@ TASKS: dict[str, TaskConfig] = {
         task_id="task_medium",
         name="Cascading Deploy Failure",
         difficulty="medium",
+        fault_type="bad_deploy",
+        fault_service="",  # determined by generate_episode() seed
+        seed=137,
         description=(
             "5 services, 1 red herring, 30 tick budget. Bad deployment upstream "
             "causes cascading failures downstream. Agent must trace the "
@@ -372,6 +471,8 @@ TASKS: dict[str, TaskConfig] = {
         num_services=5,
         num_red_herrings=1,
         max_ticks=30,
+        slo_burn_rate=2.0,
+        initial_budget=60.0,
         grader_seed=137,
         max_bad_customer_minutes=200.0,
     ),
@@ -379,6 +480,9 @@ TASKS: dict[str, TaskConfig] = {
         task_id="task_hard",
         name="Config Drift Noise Storm",
         difficulty="hard",
+        fault_type="config_drift",
+        fault_service="",  # determined by generate_episode() seed
+        seed=256,
         description=(
             "7 services, 3 red herrings, 40 tick budget. Config drift causes "
             "connection pool exhaustion. One red herring emits adversarial "
@@ -390,6 +494,8 @@ TASKS: dict[str, TaskConfig] = {
         num_services=7,
         num_red_herrings=3,
         max_ticks=40,
+        slo_burn_rate=3.0,
+        initial_budget=120.0,
         grader_seed=256,
         max_bad_customer_minutes=400.0,
     ),
@@ -658,6 +764,8 @@ __all__ = [
     "ESCALATE_SPECIALIST_TICKS",
     "ESCALATE_INVESTIGATION_COST_MULTIPLIER",
     "INVESTIGATION_ACTIONS",
+    "ActionDef",
+    "ACTION_REGISTRY",
     "TaskConfig",
     "TASKS",
     "SYSCALL_PATTERNS",

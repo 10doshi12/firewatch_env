@@ -303,10 +303,14 @@ class FirewatchEnvironment(Environment):
             self._reward_engine.reset()
             self._action_handler = ActionHandler()
             # Initialize with services_affected from fault config (PRD §11.3)
-            # Root cause + downstream dependents = affected services
+            # Root cause + all fault sources + downstream dependents = affected services
             affected = {self._fault_config.root_cause_service}
+            # SPEC-01: include all fault sources from active_faults
+            if self._mesh.active_faults:
+                for fault in self._mesh.active_faults:
+                    affected.add(fault.fault_service)
             # Add downstream dependents reachable via reverse dep graph
-            queue = [self._fault_config.root_cause_service]
+            queue = list(affected)
             visited = set(queue)
             for svc in queue:
                 for other_svc, deps in self._mesh.dependency_graph.items():

@@ -13,9 +13,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 # OpenEnv base types — provide done, reward, metadata fields
 # required by the HTTP server's serialize_observation() and deserialize_action()
@@ -93,6 +94,28 @@ ActionType = Literal[
 
 
 # --------------------------------------------------------------------------
+# FaultState — per-fault runtime state (SPEC-01 §1)
+# --------------------------------------------------------------------------
+
+@dataclass
+class FaultState:
+    """One active fault in an episode.
+
+    The engine holds List[FaultState], never a bare fault reference.
+    Single-fault tasks produce a list of length 1.
+    Dual-fault tasks produce length 2.
+    """
+
+    fault_type: str                         # one of the 5 canonical types
+    fault_service: str                      # service name in ALL_SERVICES
+    fault_speed: float = 1.0               # degradation speed multiplier
+    halted: bool = False                   # True after correct remediation applied
+    halted_at_tick: int | None = None
+    progression_tick: int = 0              # internal counter; incremented each tick
+    initial_state: dict = field(default_factory=dict)  # direct-injection overrides at reset()
+
+
+# --------------------------------------------------------------------------
 # ServiceMetrics — per-service telemetry (replaces Phase 1 ServiceSnapshot)
 # --------------------------------------------------------------------------
 
@@ -120,7 +143,13 @@ class ServiceMetrics(BaseModel):
 
     Status is NOT auto-computed — the simulation sets it explicitly
     via derive_status() after mutating metrics each tick.
+
+    extra="allow" enables task-scoped dynamic fields (SPEC-01 §4).
+    Fields like system_clock_offset_seconds are attached at reset()
+    only for tasks that declare them in task_metrics_schema.
     """
+
+    model_config = ConfigDict(extra="allow")
 
     # --- Resource attributes (OTel resource) ---
     service_name: str = Field(
@@ -486,6 +515,7 @@ def derive_status(
 # --------------------------------------------------------------------------
 
 __all__ = [
+    "FaultState",
     "ServiceMetrics",
     "Alert",
     "SystemObservation",

@@ -26,6 +26,7 @@ try:
         ESCALATE_SPECIALIST_TICKS,
         ESCALATE_INVESTIGATION_COST_MULTIPLIER,
         INVESTIGATION_ACTIONS,
+        ACTION_REGISTRY,
     )
 except ImportError:
     from models import FirewatchAction, ActionResult
@@ -45,11 +46,49 @@ except ImportError:
         ESCALATE_SPECIALIST_TICKS,
         ESCALATE_INVESTIGATION_COST_MULTIPLIER,
         INVESTIGATION_ACTIONS,
+        ACTION_REGISTRY,
     )
 
 if TYPE_CHECKING:
     from .simulation import ServiceMesh, FaultConfig
 
+
+
+# --------------------------------------------------------------------------
+# Wrong-Action Guard (SPEC-02 §2)
+# --------------------------------------------------------------------------
+
+def is_wrong_action(
+    action_name: str,
+    target_service: str | None,
+    mesh: "ServiceMesh",
+) -> bool:
+    """Determine if an action constitutes a wrong action (SPEC-02 §2).
+
+    Returns True if the action is a guarded remediation targeting a
+    non-existent or healthy service. Investigation and meta actions
+    always return False.
+
+    Uses the ACTION_REGISTRY to check:
+    1. Category must be "Remediation" (otherwise not guarded)
+    2. guard_applies must be True (False skips the check)
+    3. Target service must exist in the mesh
+    4. Target service error_rate must be >= ERROR_RATE_GUARD_THRESHOLD
+    """
+    action_def = ACTION_REGISTRY.get(action_name)
+    if action_def is None:
+        return False
+
+    if action_def.category != "Remediation":
+        return False
+
+    if not action_def.guard_applies:
+        return False
+
+    if target_service is None or target_service not in mesh.services:
+        return True  # targeting a non-existent service is always wrong
+
+    return mesh.services[target_service].http_server_error_rate < HEALTHY_ERROR_RATE_THRESHOLD
 
 
 class ActionHandler:
@@ -72,6 +111,31 @@ class ActionHandler:
         # Track active circuit breakers: {service_name: ticks_remaining}
         self._circuit_breakers: dict[str, int] = {}
         self.specialist_active_ticks: int = 0
+
+    def _halt_fault_on(
+        self,
+        mesh: "ServiceMesh",
+        target: str,
+        fault_type: str,
+    ) -> None:
+        """Halt the matching FaultState on a service (SPEC-01 §6).
+
+        Iterates mesh.active_faults to find the first non-halted fault
+        matching the target service and fault type, then marks it halted.
+        Falls back to legacy mesh.fault_halted for backward compat.
+        """
+        if mesh.active_faults:
+            for fault in mesh.active_faults:
+                if (
+                    fault.fault_service == target
+                    and fault.fault_type == fault_type
+                    and not fault.halted
+                ):
+                    fault.halted = True
+                    fault.halted_at_tick = mesh.tick_count
+                    break
+        # Always set legacy flag for backward compat
+        mesh.fault_halted = True
         # Counts how many remaining investigation actions get the specialist discount.
         # Set by escalate action. Decremented by environment.py when applying discount.
 
@@ -149,9 +213,8 @@ class ActionHandler:
             return self._trace_dependencies(target, mesh)
 
         # --- Remediation actions ---
-        # Check for wrong action: remediating a healthy service
-        target_metrics = mesh.services[target]
-        is_wrong = target_metrics.http_server_error_rate < HEALTHY_ERROR_RATE_THRESHOLD
+        # Check for wrong action via centralized guard (SPEC-02 §2)
+        is_wrong = is_wrong_action(at, target, mesh)
 
         if at == "restart_service":
             return self._restart_service(target, mesh, fault_config, is_wrong)
@@ -654,7 +717,7 @@ class ActionHandler:
 
         if target == fc.root_cause_service and fc.fault_type == "network_partition":
             # Correct: restart re-establishes connections, halts partition
-            mesh.fault_halted = True
+            self._halt_fault_on(mesh, target, "network_partition")
             svc.http_server_error_rate = max(0.0, svc.http_server_error_rate * 0.3)
             svc.http_server_request_duration_p99 = max(0.1, svc.http_server_request_duration_p99 * 0.2)
             svc.runtime_uptime_seconds = 0
@@ -700,7 +763,7 @@ class ActionHandler:
 
         if target == fc.root_cause_service and fc.fault_type == "bad_deploy":
             # Correct: halt fault progression
-            mesh.fault_halted = True
+            self._halt_fault_on(mesh, target, "bad_deploy")
             svc.last_deployment_sha = prev_sha
             svc.last_deployment_age_seconds = 172800  # Reset to old deploy age
             # Error rate starts declining
@@ -741,7 +804,7 @@ class ActionHandler:
 
         if target == fc.root_cause_service and fc.fault_type == "config_drift":
             # Correct: restore connection pool
-            mesh.fault_halted = True
+            self._halt_fault_on(mesh, target, "config_drift")
             svc.process_open_file_descriptors = 120  # Normal range
             svc.http_server_request_duration_p99 = max(
                 0.1, svc.http_server_request_duration_p99 * 0.2
@@ -797,7 +860,7 @@ class ActionHandler:
                 svc.process_memory_usage_bytes / svc.process_memory_limit_bytes
             )
             if fc.fault_type == "oom":
-                mesh.fault_halted = True
+                self._halt_fault_on(mesh, target, "oom")
             return (
                 f"Scaled {target}: memory limit increased to {new_limit_mb}Mi. "
                 f"Memory utilization dropped to "
@@ -901,8 +964,8 @@ class ActionHandler:
             drain_pct = TRAFFIC_SHIFT_MAX_DRAIN
             clamped_note = f" (clamped to {TRAFFIC_SHIFT_MAX_DRAIN:.1%} max)"
 
-        # wrong_action: draining a service below the degraded threshold
-        is_wrong = svc.http_server_error_rate < 0.10
+        # wrong_action: use centralized guard (SPEC-02 §2)
+        is_wrong = is_wrong_action("traffic_shift", target, mesh)
 
         # Mutations
         original_active = svc.http_server_active_requests
@@ -1039,4 +1102,5 @@ def _gc_pause_label(pause_ms: float) -> str:
 
 __all__ = [
     "ActionHandler",
+    "is_wrong_action",
 ]
