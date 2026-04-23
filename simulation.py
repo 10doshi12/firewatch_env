@@ -47,6 +47,7 @@ try:
         BCM_LATENCY_WEIGHT,
         BCM_LATENCY_NORMALIZED_MAX,
         TASKS,
+        TaskConfig,
     )
 except ImportError:
     from models import ServiceMetrics, FaultState, derive_status
@@ -78,6 +79,7 @@ except ImportError:
         BCM_LATENCY_WEIGHT,
         BCM_LATENCY_NORMALIZED_MAX,
         TASKS,
+        TaskConfig,
     )
 
 
@@ -810,7 +812,7 @@ def _init_service_metrics(
 
 
 def generate_episode(
-    difficulty: str, seed: int
+    difficulty: str, seed: int, task_id: str | None = None
 ) -> tuple[ServiceMesh, FaultConfig]:
     """
     Generate a procedural incident episode.
@@ -818,54 +820,89 @@ def generate_episode(
     Same seed + difficulty always produces identical episodes across
     Python runtime restarts. Uses random.Random(seed) for isolation.
 
+    Supports two modes:
+    1. **Explicit task config** (Phase 1+): When task_id is provided or the
+       TaskConfig has explicit `services` and `fault_service`, those are used
+       directly instead of random sampling.
+    2. **Legacy random sampling**: When task_id is None and TaskConfig has no
+       explicit services, falls back to random sampling from ALL_SERVICES.
+
     Args:
         difficulty: "easy", "medium", or "hard"
         seed: Integer seed for deterministic generation.
+        task_id: Optional task_id to look up specific TaskConfig.
 
     Returns:
         Tuple of (ServiceMesh, FaultConfig).
     """
     rng = random.Random(seed)
 
-    # Look up task config for this difficulty
-    task_key = f"task_{difficulty}"
-    task = TASKS.get(task_key)
+    # --- Task config lookup ---
+    # Priority: explicit task_id > seed-based lookup > legacy difficulty key
+    task: TaskConfig | None = None
+    if task_id:
+        task = TASKS.get(task_id)
+        if task is None:
+            raise ValueError(f"Unknown task_id: {task_id}")
+    else:
+        # Try seed-based lookup: match (difficulty, seed) to a registered task
+        task = _lookup_task_by_seed(difficulty, seed)
+        if task is None:
+            # Legacy fallback: use the difficulty-keyed task
+            task_key = f"task_{difficulty}"
+            task = TASKS.get(task_key)
+
     if task is None:
-        raise ValueError(f"Unknown difficulty: {difficulty}. Expected easy/medium/hard.")
+        raise ValueError(f"No task config found for difficulty={difficulty}, seed={seed}")
 
-    num_services = task.num_services
-    num_red_herrings = task.num_red_herrings
-    deg_speed = DEGRADATION_SPEED_BY_DIFFICULTY[difficulty]
+    # --- Determine episode parameters ---
+    # Explicit task config mode: use services/fault_service directly
+    has_explicit_config = bool(task.services) and bool(task.fault_service)
 
-    # 1. Sample active services
-    active_services = rng.sample(ALL_SERVICES, num_services)
+    if has_explicit_config:
+        active_services = list(task.services)
+        root_cause = task.fault_service
+        fault_type = task.fault_type
+        red_herrings = list(task.red_herrings)
+        deg_speed = task.fault_speed
+        prompt_injection_svc = None
 
-    # 2. Sample root cause
-    root_cause = rng.choice(active_services)
+        # Prompt injection from adversarial_logs (first service listed)
+        if task.adversarial_logs:
+            prompt_injection_svc = task.adversarial_logs[0].get("service")
+    else:
+        # Legacy random sampling mode
+        num_services = task.num_services
+        num_red_herrings = task.num_red_herrings
+        deg_speed = DEGRADATION_SPEED_BY_DIFFICULTY[difficulty]
 
-    # 3. Sample fault type
-    fault_pool = FAULT_TYPES_BY_DIFFICULTY[difficulty]
-    fault_type = rng.choice(fault_pool)
+        active_services = rng.sample(ALL_SERVICES, num_services)
+        root_cause = rng.choice(active_services)
 
-    # 4. Sample red herrings from remaining services
-    remaining = [s for s in active_services if s != root_cause]
-    red_herrings = rng.sample(remaining, min(num_red_herrings, len(remaining)))
+        fault_pool = FAULT_TYPES_BY_DIFFICULTY[difficulty]
+        fault_type = rng.choice(fault_pool)
 
-    # 5. Prompt injection for hard difficulty
-    prompt_injection_svc: str | None = None
-    if difficulty == "hard" and red_herrings:
-        prompt_injection_svc = rng.choice(red_herrings)
+        remaining = [s for s in active_services if s != root_cause]
+        red_herrings = rng.sample(remaining, min(num_red_herrings, len(remaining)))
 
-    # 6. Build subgraph
+        prompt_injection_svc = None
+        if difficulty == "hard" and red_herrings:
+            prompt_injection_svc = rng.choice(red_herrings)
+
+    # --- Build episode ---
+
+    # 1. Build subgraph
     dep_graph = _build_subgraph(active_services)
 
-    # 7. Initialize services
+    # 2. Initialize services
     services: dict[str, ServiceMetrics] = {}
     for svc_name in active_services:
         services[svc_name] = _init_service_metrics(svc_name, rng)
 
-    # 8. Apply static red herring degradation
+    # 3. Apply static red herring degradation
     for rh in red_herrings:
+        if rh not in services:
+            continue
         rh_metrics = services[rh]
         rh_metrics.http_server_error_rate = round(
             RED_HERRING_ERROR_RATE_MIN
@@ -878,7 +915,7 @@ def generate_episode(
             rh_metrics.process_memory_utilization,
         )
 
-    # 9. For bad_deploy fault, mark recent deployment on root cause
+    # 4. For bad_deploy fault, mark recent deployment on root cause
     if fault_type == "bad_deploy":
         root_metrics = services[root_cause]
         root_metrics.last_deployment_age_seconds = rng.randint(30, 300)
@@ -886,7 +923,7 @@ def generate_episode(
             rng.choices("0123456789abcdef", k=7)
         )
 
-    # 10. For config_drift fault, mark recent config change on root cause
+    # 5. For config_drift fault, mark recent config change on root cause
     if fault_type == "config_drift":
         root_metrics = services[root_cause]
         root_metrics.last_config_age_seconds = rng.randint(10, 120)
@@ -927,7 +964,22 @@ def generate_episode(
 
     mesh.active_faults = active_faults
 
-    # --- SPEC-01 §3: Direct state injection ---
+    # --- SPEC-03: Apply initial_state_overrides ---
+    # These override per-service fields BEFORE any fault physics run.
+    # Applied after red herring degradation so explicit values take precedence.
+    if task and task.initial_state_overrides:
+        for svc_name, overrides in task.initial_state_overrides.items():
+            svc = mesh.services.get(svc_name)
+            if svc is not None:
+                for field_name, value in overrides.items():
+                    setattr(svc, field_name, value)
+                svc.status = derive_status(
+                    svc.http_server_error_rate,
+                    svc.http_server_request_duration_p99,
+                    svc.process_memory_utilization,
+                )
+
+    # --- SPEC-01 §3: Direct state injection from FaultState ---
     for fs in active_faults:
         if fs.initial_state:
             svc = mesh.services.get(fs.fault_service)
@@ -953,6 +1005,18 @@ def generate_episode(
         mesh._adversarial_logs = list(task.adversarial_logs)
 
     return mesh, fault_config
+
+
+def _lookup_task_by_seed(difficulty: str, seed: int) -> "TaskConfig | None":
+    """Reverse-lookup a TaskConfig by (difficulty, seed) pair.
+
+    Scans TASKS for a config matching both difficulty and seed.
+    Returns None if no explicit match found (legacy fallback).
+    """
+    for task in TASKS.values():
+        if task.difficulty == difficulty and task.seed == seed:
+            return task
+    return None
 
 
 def _count_blast_radius(mesh: "ServiceMesh", fault_config: "FaultConfig") -> int:

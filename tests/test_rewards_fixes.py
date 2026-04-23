@@ -111,29 +111,31 @@ def test_variance_check():
     assert perfect - zero >= 0.50, f"gap={perfect - zero:.3f}, expected >= 0.50"
 
 
-# ── Fix 4: MTTM requires 3 consecutive zero-BCM ticks ─────────────────────
+# ── Fix 4: MTTM requires 2 consecutive zero-BCM ticks ─────────────────────
 
 def test_mttm_requires_3_consecutive_zero_bcm_ticks():
-    """MTTM must not be granted until 3 consecutive ticks with bcm_delta == 0."""
+    """MTTM uses 2-tick streak (see IncidentMetrics docstring).
+
+    The 2-tick streak is a mechanical necessity: at optimal play on easy
+    (5 steps), a 3-tick streak cannot be reached before declare_resolved.
+    This test verifies the 2-tick behavior documented in the implementation.
+    """
     from firewatch_env.simulation import IncidentMetrics
     m = IncidentMetrics()
     m.update(bcm_delta=1.0, current_tick=1)   # BCM still moving
     m.update(bcm_delta=0.0, current_tick=2)   # streak=1
-    m.update(bcm_delta=0.0, current_tick=3)   # streak=2
-    assert m.mttm_achieved_tick is None, "must not grant MTTM after only 2 consecutive zeros"
-    m.update(bcm_delta=0.0, current_tick=4)   # streak=3 → granted at tick 4-2=2
+    assert m.mttm_achieved_tick is None, "must not grant MTTM after only 1 consecutive zero"
+    m.update(bcm_delta=0.0, current_tick=3)   # streak=2 → granted at tick 3-1=2
     assert m.mttm_achieved_tick == 2, f"expected mttm_achieved_tick=2, got {m.mttm_achieved_tick}"
 
 
 def test_mttm_streak_resets_on_nonzero():
-    """A non-zero BCM tick must reset the streak — MTTM only after 3 unbroken zeros."""
+    """A non-zero BCM tick must reset the streak — MTTM only after 2 unbroken zeros."""
     from firewatch_env.simulation import IncidentMetrics
     m = IncidentMetrics()
     m.update(bcm_delta=0.0, current_tick=1)   # streak=1
-    m.update(bcm_delta=0.0, current_tick=2)   # streak=2
-    m.update(bcm_delta=1.0, current_tick=3)   # non-zero resets streak
-    m.update(bcm_delta=0.0, current_tick=4)   # streak=1 again
-    m.update(bcm_delta=0.0, current_tick=5)   # streak=2
+    m.update(bcm_delta=1.0, current_tick=2)   # non-zero resets streak
+    m.update(bcm_delta=0.0, current_tick=3)   # streak=1 again
     assert m.mttm_achieved_tick is None, "streak was reset; MTTM must not be granted yet"
-    m.update(bcm_delta=0.0, current_tick=6)   # streak=3 → granted at tick 6-2=4
-    assert m.mttm_achieved_tick == 4, f"expected mttm_achieved_tick=4, got {m.mttm_achieved_tick}"
+    m.update(bcm_delta=0.0, current_tick=4)   # streak=2 → granted at tick 4-1=3
+    assert m.mttm_achieved_tick == 3, f"expected mttm_achieved_tick=3, got {m.mttm_achieved_tick}"

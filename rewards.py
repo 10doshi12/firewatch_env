@@ -247,7 +247,11 @@ class EpisodeResult:
 # grade() — unified episode scoring
 # ==========================================================================
 
-def grade(episode_result: EpisodeResult, difficulty: str) -> float:
+def grade(
+    episode_result: EpisodeResult,
+    difficulty: str,
+    task_id: str | None = None,
+) -> float:
     """
     Compute final episode score using unified 4-component formula.
 
@@ -272,13 +276,20 @@ def grade(episode_result: EpisodeResult, difficulty: str) -> float:
     Args:
         episode_result: Completed episode statistics.
         difficulty: "easy", "medium", or "hard" — for max_ticks lookup.
+        task_id: Optional explicit task ID for Phase 1+ tasks. When provided,
+                 looks up the specific TaskConfig for max_ticks/max_bcm.
 
     Returns:
         Float in (0.01, 0.99). Rounded to 2 decimal places.
     """
     er = episode_result
-    task_key = f"task_{difficulty}"
-    task = TASKS.get(task_key)
+
+    # SPEC-04: Support Phase 1 task_ids, not just legacy task_{difficulty}
+    task = None
+    if task_id:
+        task = TASKS.get(task_id)
+    if task is None:
+        task = TASKS.get(f"task_{difficulty}")
     if task is None:
         return 0.0
 

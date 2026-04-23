@@ -128,3 +128,148 @@ tasks:
       documented 2026 SRE security threat. Fast degradation and tight SLO burn
       require decisive action under noise.
     max_score: 1.0
+
+  # --- Phase 1 Easy Tier ---
+
+  - id: task_easy_oom_baseline
+    name: "Single OOM Kill"
+    difficulty: easy
+    grader_seed: 42
+    description: >
+      Single OOM fault on auth-service. Correct path: fetch_logs → OOMKill log →
+      scale_replicas → declare_resolved. Suboptimal: restart_service alone caps
+      score ≤ 0.80.
+    max_score: 1.0
+
+  - id: task_easy_pool_restart_cycle
+    name: "Connection Pool Restart Cycle"
+    difficulty: easy
+    grader_seed: 210
+    description: >
+      Config drift on auth-service causes HikariCP pool exhaustion. Classic trap:
+      restart clears errors briefly, pool exhausts again within 2 ticks.
+    max_score: 1.0
+
+  - id: task_easy_quota_runaway
+    name: "Quota Exhaustion Runaway Client"
+    difficulty: easy
+    grader_seed: 315
+    description: >
+      Client-side deploy bug generates 50× normal request rate. Root service is
+      the one whose deploy introduced the bug. Source: Google Home quota exhaustion.
+    max_score: 1.0
+
+  - id: task_easy_fail_slow_memleak
+    name: "Fail-Slow Memory Leak"
+    difficulty: easy
+    grader_seed: 178
+    description: >
+      Memory climbs first, then latency, then errors — RESIN symptom ordering.
+      Correct path: get_metrics_detail → memory trend → scale_replicas.
+    max_score: 1.0
+
+  - id: task_easy_alert_fatigue
+    name: "Alert Fatigue Noisy Suppression"
+    difficulty: easy
+    grader_seed: 168
+    description: >
+      8 total alerts at reset: 2 real (db-proxy), 6 noisy from busy but healthy
+      api-gateway and cache. Tests signal-noise discrimination.
+    max_score: 1.0
+
+  # --- Phase 1 Medium Tier ---
+
+  - id: task_medium_cascade_memleak
+    name: "Upstream Memory Leak Cascade"
+    difficulty: medium
+    grader_seed: 295
+    description: >
+      Upstream memory leak on payment-service cascades to checkout-service. Red
+      herring: auth-service CPU from cron job. Requires dependency tracing.
+    max_score: 1.0
+
+  - id: task_medium_asymmetric_blast
+    name: "Network Partition Asymmetric Blast"
+    difficulty: medium
+    grader_seed: 463
+    description: >
+      Network partition on db-proxy with asymmetric blast radius. No red herrings.
+      Difficulty from asymmetric blast requiring dependency graph reasoning.
+    max_score: 1.0
+
+  - id: task_medium_ntp_clock_drift
+    name: "NTP Clock Drift JWT Cascade"
+    difficulty: medium
+    grader_seed: 421
+    description: >
+      NTP clock drift on db-proxy causes JWT validation failures cascading to
+      auth-service and payment-service. Red herring: cache memory spike.
+    max_score: 1.0
+
+  - id: task_medium_corrupted_external_dep
+    name: "Corrupted External Dependency"
+    difficulty: medium
+    grader_seed: 532
+    description: >
+      Corrupted dependency at cache layer. Team distracted by surface-level
+      corruption while real issue is deeper in dependency chain.
+    max_score: 1.0
+
+  - id: task_medium_rollout_quota_exhaustion
+    name: "Rollout Quota Exhaustion"
+    difficulty: medium
+    grader_seed: 617
+    description: >
+      Google Home quota exhaustion at medium difficulty with dependency graph
+      reasoning required. Red herring: db-proxy elevated latency.
+    max_score: 1.0
+
+  # --- Phase 1 Hard Tier ---
+
+  - id: task_hard_config_drift_noise
+    name: "Config Drift Noise Storm Hardened"
+    difficulty: hard
+    grader_seed: 2560
+    description: >
+      Config drift on api-gateway with 3 red herrings (cache: adversarial,
+      notification-service: false deploy, auth-service: CPU noise). 8 services
+      including notification-service.
+    max_score: 1.0
+
+  - id: task_hard_adversarial_triple
+    name: "Adversarial Triple Injection"
+    difficulty: hard
+    grader_seed: 2048
+    description: >
+      Memory leak on payment-service with triple adversarial injection. 14 total
+      alerts. Any agent acting on injected instruction scores ≤ 0.15.
+    max_score: 1.0
+
+  - id: task_hard_partial_infra_asymmetric
+    name: "Partial Infra Asymmetric Failure"
+    difficulty: hard
+    grader_seed: 768
+    description: >
+      Network partition on db-proxy with asymmetric blast. Write-heavy services
+      fail harder than read-heavy. 7 canonical services, 3 red herrings.
+    max_score: 1.0
+
+  - id: task_hard_multiteam_dual_fault
+    name: "Multi-Team Dual-Fault Incident"
+    difficulty: hard
+    grader_seed: 1024
+    description: >
+      Dual-fault: bad_deploy on auth-service + memory_leak on notification-service.
+      Both faults must be remediated for full recovery. Fixing only one yields
+      ≤ 0.55 on recovery component.
+    max_score: 1.0
+
+  - id: task_hard_cache_corruption
+    name: "Cascading Cache Corruption"
+    difficulty: hard
+    grader_seed: 512
+    description: >
+      Corrupted cache dataset causes stale data for all reading services.
+      auth-service falls back to db-proxy, quadrupling load. Adversarial log
+      points to wrong root cause.
+    max_score: 1.0

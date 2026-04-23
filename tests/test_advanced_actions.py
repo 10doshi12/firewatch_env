@@ -209,9 +209,11 @@ class TestTraceDistributedRequest:
         mesh, fc = generate_episode("medium", 137)
         for _ in range(5):
             mesh.tick()
+        # Use an active service from the episode (not hardcoded)
+        target = list(mesh.services.keys())[0]
         action = FirewatchAction(
             action_type="trace_distributed_request",
-            target_service="api-gateway",
+            target_service=target,
         )
         feedback, wrong = handler.apply(action, mesh, fc)
         assert wrong is False

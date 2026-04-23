@@ -36,6 +36,7 @@ try:
     from ..actions import ActionHandler
     from ..rewards import RewardEngine, EpisodeResult, grade, build_info_dict, compute_premature_exit_penalty
     from ..config import (
+        ALL_SERVICES,
         TASKS,
         SLO_BUDGET_BY_DIFFICULTY,
         SLO_BURN_RATE_BY_DIFFICULTY,
@@ -57,6 +58,7 @@ except ImportError:
     from actions import ActionHandler
     from rewards import RewardEngine, EpisodeResult, grade, build_info_dict, compute_premature_exit_penalty
     from config import (
+        ALL_SERVICES,
         TASKS,
         SLO_BUDGET_BY_DIFFICULTY,
         SLO_BURN_RATE_BY_DIFFICULTY,
@@ -258,6 +260,7 @@ class FirewatchEnvironment(Environment):
         self._prev_obs: SystemObservation | None = None
         self._action_history: list[dict[str, str]] = []
         self._episode_done: bool = False
+        self._task_id: str | None = None
         self._max_ticks: int = 20
 
     # ------------------------------------------------------------------
@@ -268,6 +271,7 @@ class FirewatchEnvironment(Environment):
         self,
         difficulty: str = "easy",
         seed: int | None = None,
+        task_id: str | None = None,
         **kwargs,
     ) -> SystemObservation:
         """
@@ -277,6 +281,8 @@ class FirewatchEnvironment(Environment):
             difficulty: One of "easy", "medium", "hard".
             seed: Optional integer seed for reproducible episodes.
                   Same seed + difficulty always produces the same episode.
+            task_id: Optional explicit task ID for Phase 1+ task configs.
+                     When provided, uses the specific TaskConfig directly.
 
         Returns:
             SystemObservation with initial system state.
@@ -289,9 +295,44 @@ class FirewatchEnvironment(Environment):
             self._state = State(episode_id=str(uuid4()), step_count=0)
             self._difficulty = difficulty
             self._episode_seed = seed
+            self._task_id = task_id
 
-            # Generate episode
-            self._mesh, self._fault_config = generate_episode(difficulty, seed)
+            # --- SPEC-04 §4: Fail-fast service validation ---
+            # Verify all service references exist in ALL_SERVICES before generating.
+            _task_cfg = None
+            if task_id:
+                _task_cfg = TASKS.get(task_id)
+            if _task_cfg is None:
+                for _t in TASKS.values():
+                    if _t.difficulty == difficulty and _t.seed == seed:
+                        _task_cfg = _t
+                        break
+            if _task_cfg is not None:
+                _all_svc_set = set(ALL_SERVICES)
+                _refs: set[str] = set()
+                _refs.update(_task_cfg.services)
+                if _task_cfg.fault_service:
+                    _refs.add(_task_cfg.fault_service)
+                if _task_cfg.secondary_fault_service:
+                    _refs.add(_task_cfg.secondary_fault_service)
+                _refs.update(_task_cfg.red_herrings)
+                if _task_cfg.adversarial_logs:
+                    for _adv in _task_cfg.adversarial_logs:
+                        _adv_svc = _adv.get("service")
+                        if _adv_svc:
+                            _refs.add(_adv_svc)
+                _refs.update(_task_cfg.task_metrics_schema.keys())
+                for _svc_name in _refs:
+                    if _svc_name and _svc_name not in _all_svc_set:
+                        raise ValueError(
+                            f"Task {_task_cfg.task_id} references unregistered "
+                            f"service: {_svc_name}"
+                        )
+
+            # Generate episode (task_id enables SPEC-03 explicit task configs)
+            self._mesh, self._fault_config = generate_episode(
+                difficulty, seed, task_id=task_id
+            )
 
             # Propagate initial fault so tick=0 observation shows degradation.
             # Without this, generate_episode() sets fault config but hasn't run
@@ -331,9 +372,18 @@ class FirewatchEnvironment(Environment):
             self._action_history = []
             self._episode_done = False
 
-            # Look up max ticks for this difficulty
-            task_key = f"task_{difficulty}"
-            task_config = TASKS.get(task_key)
+            # Look up max ticks — try task_id first, then seed-based, then legacy
+            task_config = None
+            if task_id:
+                task_config = TASKS.get(task_id)
+            if task_config is None:
+                # Seed-based or legacy lookup
+                for t in TASKS.values():
+                    if t.difficulty == difficulty and t.seed == seed:
+                        task_config = t
+                        break
+            if task_config is None:
+                task_config = TASKS.get(f"task_{difficulty}")
             self._max_ticks = task_config.max_ticks if task_config else 20
 
             # Build initial observation
@@ -538,7 +588,10 @@ class FirewatchEnvironment(Environment):
             # --- 10. Grade if done ---
             episode_score: float | None = None
             if done:
-                episode_score = grade(self._episode_result, self._difficulty)
+                episode_score = grade(
+                    self._episode_result, self._difficulty,
+                    task_id=self._task_id,
+                )
                 self._episode_done = True
 
             # --- 11. Build rich info dict ---
