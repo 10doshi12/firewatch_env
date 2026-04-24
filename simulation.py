@@ -48,6 +48,13 @@ try:
         BCM_LATENCY_NORMALIZED_MAX,
         TASKS,
         TaskConfig,
+        # SPEC-06 §H-R2: Metastable loop constants
+        METASTABLE_QUEUE_DEPTH_INITIAL,
+        METASTABLE_LATENCY_P99,
+        METASTABLE_ERROR_RATE,
+        METASTABLE_RETRY_AMPLIFICATION,
+        METASTABLE_BREAK_QUEUE_THRESHOLD,
+        METASTABLE_BREAK_RETRY_THRESHOLD,
     )
 except ImportError:
     from models import ServiceMetrics, FaultState, derive_status
@@ -80,6 +87,13 @@ except ImportError:
         BCM_LATENCY_NORMALIZED_MAX,
         TASKS,
         TaskConfig,
+        # SPEC-06 §H-R2: Metastable loop constants
+        METASTABLE_QUEUE_DEPTH_INITIAL,
+        METASTABLE_LATENCY_P99,
+        METASTABLE_ERROR_RATE,
+        METASTABLE_RETRY_AMPLIFICATION,
+        METASTABLE_BREAK_QUEUE_THRESHOLD,
+        METASTABLE_BREAK_RETRY_THRESHOLD,
     )
 
 
@@ -452,13 +466,66 @@ class ServiceMesh:
     # ------------------------------------------------------------------
 
     def _apply_fault_physics_for(self, fault: FaultState) -> None:
-        """Apply fault-specific degradation for one FaultState."""
+        """Apply fault-specific degradation for one FaultState.
+
+        SPEC-06 §H-R2: For config_drift faults with metastable_feedback_loop_active,
+        applies metastable amplification physics. The loop breaks ONLY when BOTH:
+          - http_server_request_queue_depth < METASTABLE_BREAK_QUEUE_THRESHOLD (300)
+          - effective_rps_multiplier < METASTABLE_BREAK_RETRY_THRESHOLD (1.2)
+        """
         svc = self.services.get(fault.fault_service)
         if svc is None:
             return
 
         speed = fault.fault_speed
 
+        # --- SPEC-06 §H-R2: Metastable feedback loop physics ---
+        if fault.fault_type == "config_drift":
+            # Check if this service has metastable loop active (task-scoped metric)
+            metastable_active = getattr(svc, "metastable_feedback_loop_active", False)
+            if metastable_active:
+                # Check break conditions: BOTH must be satisfied
+                queue_depth = getattr(svc, "http_server_request_queue_depth", METASTABLE_QUEUE_DEPTH_INITIAL)
+                # Find the retrying service's effective_rps_multiplier
+                # (typically api-gateway or another upstream service)
+                retry_below_threshold = False
+                for name, m in self.services.items():
+                    if name == fault.fault_service:
+                        continue
+                    rps_mult = getattr(m, "effective_rps_multiplier", 1.0)
+                    if rps_mult < METASTABLE_BREAK_RETRY_THRESHOLD:
+                        retry_below_threshold = True
+                        break
+                # If no other service has rps_multiplier, check if it's on self
+                if not retry_below_threshold:
+                    rps_mult_self = getattr(svc, "effective_rps_multiplier", 1.0)
+                    if rps_mult_self < METASTABLE_BREAK_RETRY_THRESHOLD:
+                        retry_below_threshold = True
+
+                queue_below = queue_depth < METASTABLE_BREAK_QUEUE_THRESHOLD
+
+                if queue_below and retry_below_threshold:
+                    # Loop breaks — transition to recovery
+                    svc.metastable_feedback_loop_active = False
+                    svc.http_server_request_queue_depth = max(0, queue_depth - 200)
+                    svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.5)
+                    svc.http_server_request_duration_p99 = max(0.1, svc.http_server_request_duration_p99 * 0.3)
+                    return  # Skip normal config_drift physics — loop has broken
+                else:
+                    # Loop continues — apply metastable amplification
+                    svc.http_server_request_queue_depth = max(0, queue_depth + int(speed * 50))
+                    svc.http_server_request_duration_p99 = min(
+                        30.0, svc.http_server_request_duration_p99 + speed * 0.5
+                    )
+                    svc.http_server_error_rate = min(
+                        1.0, svc.http_server_error_rate + speed * METASTABLE_ERROR_RATE * 0.5
+                    )
+                    # Queue drain rate decreases as queue grows
+                    drain_rate = getattr(svc, "http_server_queue_drain_rate", 50.0)
+                    svc.http_server_queue_drain_rate = max(10.0, drain_rate - speed * 5.0)
+                    return  # Metastable physics applied instead of normal config_drift
+
+        # --- Standard fault dispatch (all types) ---
         if fault.fault_type == "oom":
             self._apply_oom(svc, speed)
         elif fault.fault_type == "memory_leak":

@@ -12,6 +12,7 @@ try:
     from .models import FirewatchAction, ActionResult
     from .config import (
         HEALTHY_ERROR_RATE_THRESHOLD,
+        LATENCY_GUARD_THRESHOLD,
         FULL_DEPENDENCY_GRAPH,
         SLO_BURN_RATE_BY_DIFFICULTY,
         SECONDS_PER_TICK,
@@ -32,6 +33,7 @@ except ImportError:
     from models import FirewatchAction, ActionResult
     from config import (
         HEALTHY_ERROR_RATE_THRESHOLD,
+        LATENCY_GUARD_THRESHOLD,
         FULL_DEPENDENCY_GRAPH,
         SLO_BURN_RATE_BY_DIFFICULTY,
         SECONDS_PER_TICK,
@@ -63,7 +65,7 @@ def is_wrong_action(
     target_service: str | None,
     mesh: "ServiceMesh",
 ) -> bool:
-    """Determine if an action constitutes a wrong action (SPEC-02 §2).
+    """Determine if an action constitutes a wrong action (SPEC-02 §2, SPEC-06 §1).
 
     Returns True if the action is a guarded remediation targeting a
     non-existent or healthy service. Investigation and meta actions
@@ -73,7 +75,11 @@ def is_wrong_action(
     1. Category must be "Remediation" (otherwise not guarded)
     2. guard_applies must be True (False skips the check)
     3. Target service must exist in the mesh
-    4. Target service error_rate must be >= ERROR_RATE_GUARD_THRESHOLD
+    4. Service is considered healthy only when BOTH:
+       - error_rate < HEALTHY_ERROR_RATE_THRESHOLD (0.05)
+       - latency_p99 < LATENCY_GUARD_THRESHOLD (0.50s)
+       This dual check fixes gray failure (H-R1) where error_rate ≈ 0%
+       but latency is 8× baseline due to TCP retransmission masking.
     """
     action_def = ACTION_REGISTRY.get(action_name)
     if action_def is None:
@@ -88,7 +94,12 @@ def is_wrong_action(
     if target_service is None or target_service not in mesh.services:
         return True  # targeting a non-existent service is always wrong
 
-    return mesh.services[target_service].http_server_error_rate < HEALTHY_ERROR_RATE_THRESHOLD
+    svc = mesh.services[target_service]
+    service_is_healthy = (
+        svc.http_server_error_rate < HEALTHY_ERROR_RATE_THRESHOLD
+        and svc.http_server_request_duration_p99 < LATENCY_GUARD_THRESHOLD
+    )
+    return service_is_healthy
 
 
 class ActionHandler:
@@ -212,25 +223,6 @@ class ActionHandler:
         if at == "trace_dependencies":
             return self._trace_dependencies(target, mesh)
 
-        # --- Remediation actions ---
-        # Check for wrong action via centralized guard (SPEC-02 §2)
-        is_wrong = is_wrong_action(at, target, mesh)
-
-        if at == "restart_service":
-            return self._restart_service(target, mesh, fault_config, is_wrong)
-
-        if at == "rollback_deploy":
-            return self._rollback_deploy(target, mesh, fault_config, is_wrong)
-
-        if at == "revert_config":
-            return self._revert_config(target, mesh, fault_config, is_wrong)
-
-        if at == "scale_replicas":
-            return self._scale_replicas(target, mesh, fault_config, action, is_wrong)
-
-        if at == "circuit_break":
-            return self._circuit_break(target, mesh, fault_config, is_wrong)
-
         # --- Advanced diagnostic investigation actions (SPEC-9) ---
         if at == "strace_process":
             return self._strace_process(target, mesh, fault_config)
@@ -250,9 +242,131 @@ class ActionHandler:
         if at == "inspect_commit_diff":
             return self._inspect_commit_diff(target, mesh, fault_config)
 
+        # --- Phase 2 investigation actions (SPEC-05) ---
+        if at == "inspect_network_policy":
+            return self._inspect_network_policy(target, mesh, fault_config)
+
+        if at == "inspect_quota_usage":
+            return self._inspect_quota_usage(target, mesh, fault_config)
+
+        if at == "inspect_consensus_state":
+            return self._inspect_consensus_state(target, mesh, fault_config)
+
+        if at == "inspect_cluster_topology":
+            return self._inspect_cluster_topology(target, mesh, fault_config)
+
+        # --- Remediation actions ---
+        # Check for wrong action via centralized guard (SPEC-02 §2)
+        is_wrong = is_wrong_action(at, target, mesh)
+
+        if at == "restart_service":
+            return self._restart_service(target, mesh, fault_config, is_wrong)
+
+        if at == "rollback_deploy":
+            return self._rollback_deploy(target, mesh, fault_config, is_wrong)
+
+        if at == "revert_config":
+            return self._revert_config(target, mesh, fault_config, is_wrong)
+
+        if at == "scale_replicas":
+            return self._scale_replicas(target, mesh, fault_config, action, is_wrong)
+
+        if at == "circuit_break":
+            return self._circuit_break(target, mesh, fault_config, is_wrong)
+
         # --- Advanced remediation actions (SPEC-9) ---
         if at == "traffic_shift":
             return self._traffic_shift(target, mesh, fault_config, action.parameters)
+
+        # --- Phase 2 Easy tier remediation (SPEC-05) ---
+        if at == "enable_connection_throttle":
+            return self._enable_connection_throttle(target, mesh, fault_config, is_wrong)
+
+        if at == "extend_timeout":
+            return self._extend_timeout(target, mesh, fault_config, is_wrong)
+
+        if at == "optimize_query":
+            return self._optimize_query(target, mesh, fault_config, is_wrong)
+
+        if at == "rebalance_load":
+            return self._rebalance_load(target, mesh, fault_config, is_wrong)
+
+        if at == "adjust_probe_timing":
+            return self._adjust_probe_timing(target, mesh, fault_config, is_wrong)
+
+        if at == "set_log_level":
+            return self._set_log_level(target, mesh, fault_config, action, is_wrong)
+
+        # --- Phase 2 Medium tier remediation (SPEC-05) ---
+        if at == "disable_retries":
+            return self._disable_retries(target, mesh, fault_config, is_wrong)
+
+        if at == "configure_retry_backoff":
+            return self._configure_retry_backoff(target, mesh, fault_config, is_wrong)
+
+        if at == "rollback_canary":
+            return self._rollback_canary(target, mesh, fault_config, is_wrong)
+
+        if at == "promote_canary":
+            return self._promote_canary(target, mesh, fault_config, is_wrong)
+
+        if at == "redirect_reads_to_primary":
+            return self._redirect_reads_to_primary(target, mesh, fault_config, is_wrong)
+
+        if at == "force_replica_resync":
+            return self._force_replica_resync(target, mesh, fault_config, is_wrong)
+
+        if at == "evict_cache_by_pattern":
+            return self._evict_cache_by_pattern(target, mesh, fault_config, is_wrong)
+
+        if at == "increase_cache_memory":
+            return self._increase_cache_memory(target, mesh, fault_config, is_wrong)
+
+        if at == "complete_traffic_switch":
+            return self._complete_traffic_switch(target, mesh, fault_config, action, is_wrong)
+
+        if at == "deregister_stale_instances":
+            return self._deregister_stale_instances(target, mesh, fault_config, is_wrong)
+
+        if at == "enable_deadline_propagation":
+            return self._enable_deadline_propagation(target, mesh, fault_config, is_wrong)
+
+        # --- Phase 2 Hard tier remediation (SPEC-05) ---
+        if at == "revert_network_policy":
+            return self._revert_network_policy(target, mesh, fault_config)
+
+        if at == "disable_fallback_mode":
+            return self._disable_fallback_mode(target, mesh, fault_config, is_wrong)
+
+        if at == "request_quota_increase":
+            return self._request_quota_increase(target, mesh, fault_config, action, is_wrong)
+
+        if at == "force_leader_election":
+            return self._force_leader_election(target, mesh, fault_config, is_wrong)
+
+        if at == "isolate_minority_nodes":
+            return self._isolate_minority_nodes(target, mesh, fault_config, is_wrong)
+
+        if at == "redirect_config_reads_to_majority":
+            return self._redirect_config_reads_to_majority(target, mesh, fault_config, is_wrong)
+
+        if at == "flush_diverged_keys":
+            return self._flush_diverged_keys(target, mesh, fault_config, is_wrong)
+
+        if at == "force_cluster_resync":
+            return self._force_cluster_resync(target, mesh, fault_config, is_wrong)
+
+        if at == "enable_cache_warming":
+            return self._enable_cache_warming(target, mesh, fault_config, is_wrong)
+
+        if at == "rate_limit_cache_misses":
+            return self._rate_limit_cache_misses(target, mesh, fault_config, is_wrong)
+
+        if at == "rebalance_az_traffic":
+            return self._rebalance_az_traffic(target, mesh, fault_config)
+
+        if at == "scale_az_capacity":
+            return self._scale_az_capacity(target, mesh, fault_config)
 
         return (f"Unknown action type: {at}. No action taken.", False)
 
@@ -1049,6 +1163,477 @@ class ActionHandler:
             )
 
         return (feedback, False)
+
+    # ------------------------------------------------------------------
+    # Phase 2 Investigation actions (SPEC-05)
+    # ------------------------------------------------------------------
+
+    def _inspect_network_policy(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig",
+    ) -> tuple[str, bool]:
+        """Returns network policies affecting target. Does NOT modify state."""
+        svc = mesh.services[target]
+        if target == fc.root_cause_service and fc.fault_type == "network_partition":
+            feedback = (
+                f"Network policy inspection for {target}:\n"
+                f'{{"rules": [{{"action": "drop", "match": "inbound", '
+                f'"packet_loss_pct": 15.0, "affected_ports": [5432, 6379]}}], '
+                f'"packet_loss_pct": 15.0, "affected_ports": [5432, 6379]}}\n'
+                f"[Analysis] Active packet loss policy detected. Recommend revert_network_policy."
+            )
+        else:
+            feedback = (
+                f"Network policy inspection for {target}:\n"
+                f'{{"rules": [], "packet_loss_pct": 0.0, "affected_ports": []}}\n'
+                f"[Analysis] No anomalous network policies detected."
+            )
+        return (feedback, False)
+
+    def _inspect_quota_usage(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig",
+    ) -> tuple[str, bool]:
+        """Returns quota utilization for target. Does NOT modify state."""
+        svc = mesh.services[target]
+        if target == fc.root_cause_service and fc.fault_type in ("config_drift", "bad_deploy"):
+            feedback = (
+                f"Quota usage for {target}:\n"
+                f'{{"gpu_compute": {{"used": 95, "limit": 100, "remaining_ratio": 0.05}}, '
+                f'"bandwidth": {{"used": 88, "limit": 100, "remaining_ratio": 0.12}}, '
+                f'"db_connections": {{"used": 48, "limit": 50, "remaining_ratio": 0.04}}}}\n'
+                f"[Analysis] Multiple quotas near exhaustion. Recommend request_quota_increase."
+            )
+        else:
+            feedback = (
+                f"Quota usage for {target}:\n"
+                f'{{"gpu_compute": {{"used": 30, "limit": 100, "remaining_ratio": 0.70}}, '
+                f'"bandwidth": {{"used": 25, "limit": 100, "remaining_ratio": 0.75}}, '
+                f'"db_connections": {{"used": 10, "limit": 50, "remaining_ratio": 0.80}}}}\n'
+                f"[Analysis] All quotas within normal range."
+            )
+        return (feedback, False)
+
+    def _inspect_consensus_state(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig",
+    ) -> tuple[str, bool]:
+        """Returns consensus cluster state. Does NOT modify state."""
+        svc = mesh.services[target]
+        if target == fc.root_cause_service and fc.fault_type == "network_partition":
+            feedback = (
+                f"Consensus state for {target}:\n"
+                f'{{"nodes": 5, "leader": "node-2", "term": 47, "quorum_healthy": false, '
+                f'"healthy_node_count": 3, '
+                f'"partition_status_per_node": {{"node-1": "majority", "node-2": "majority", '
+                f'"node-3": "majority", "node-4": "minority", "node-5": "minority"}}, '
+                f'"config_age_seconds": {{"node-1": 2, "node-4": 3600, "node-5": 3600}}}}\n'
+                f"[Analysis] Split-brain detected. 2 minority nodes serving stale config."
+            )
+        else:
+            feedback = (
+                f"Consensus state for {target}:\n"
+                f'{{"nodes": 5, "leader": "node-1", "term": 42, "quorum_healthy": true, '
+                f'"healthy_node_count": 5, '
+                f'"partition_status_per_node": {{}}, "config_age_seconds": {{}}}}\n'
+                f"[Analysis] Consensus cluster healthy. No partition detected."
+            )
+        return (feedback, False)
+
+    def _inspect_cluster_topology(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig",
+    ) -> tuple[str, bool]:
+        """Returns Redis cluster topology. Does NOT modify state."""
+        svc = mesh.services[target]
+        if target == fc.root_cause_service and fc.fault_type == "network_partition":
+            feedback = (
+                f"Cluster topology for {target}:\n"
+                f'{{"nodes": 6, "slot_map": "0-8191:master-1, 8192-16383:master-2", '
+                f'"split_brain_detected": true, "diverged_key_count": 1247, '
+                f'"partition_duration_seconds": 180}}\n'
+                f"[Analysis] Split-brain detected. 1247 diverged keys. "
+                f"Recommend flush_diverged_keys + force_cluster_resync."
+            )
+        else:
+            feedback = (
+                f"Cluster topology for {target}:\n"
+                f'{{"nodes": 6, "slot_map": "0-8191:master-1, 8192-16383:master-2", '
+                f'"split_brain_detected": false, "diverged_key_count": 0, '
+                f'"partition_duration_seconds": 0}}\n'
+                f"[Analysis] Cluster topology healthy. No split-brain."
+            )
+        return (feedback, False)
+
+    # ------------------------------------------------------------------
+    # Phase 2 Easy Tier Remediation (SPEC-05)
+    # ------------------------------------------------------------------
+
+    def _enable_connection_throttle(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Rate-limit inbound connections to target service."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Connection throttle enabled on {target} (error_rate {svc.http_server_error_rate:.4f}). Service was not degraded — unnecessary throttle.", True)
+        if target == fc.root_cause_service and fc.fault_type == "bad_deploy":
+            self._halt_fault_on(mesh, target, "bad_deploy")
+            svc.http_server_active_requests = max(50, svc.http_server_active_requests // 2)
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.4)
+            return (f"Connection throttle enabled on {target}. Inbound rate capped. Active requests declining.", False)
+        svc.http_server_active_requests = max(50, svc.http_server_active_requests // 2)
+        return (f"Connection throttle enabled on {target}. Active requests reduced but underlying fault persists.", False)
+
+    def _extend_timeout(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Increase downstream timeout budget on target."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Timeout extended on {target} (error_rate {svc.http_server_error_rate:.4f}). Service was not degraded — unnecessary.", True)
+        svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.3)
+        return (f"Downstream timeout extended on {target} to 15000ms. Timeout-caused errors clearing.", False)
+
+    def _optimize_query(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Optimize DB query on target, halting query slowness."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Query optimized on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded — unnecessary.", True)
+        if target == fc.root_cause_service and fc.fault_type in ("config_drift", "bad_deploy"):
+            self._halt_fault_on(mesh, target, fc.fault_type)
+            svc.http_server_request_duration_p99 = 0.08
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.3)
+            return (f"Query plan optimized on {target}. p99 latency recovering. Slow query threshold no longer exceeded.", False)
+        svc.http_server_request_duration_p99 = max(0.1, svc.http_server_request_duration_p99 * 0.5)
+        return (f"Query optimized on {target} but underlying fault is not query-related.", False)
+
+    def _rebalance_load(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Reset lb_weight_normalized across all replicas."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Load rebalanced on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded — unnecessary.", True)
+        if target == fc.root_cause_service and fc.fault_type == "config_drift":
+            self._halt_fault_on(mesh, target, "config_drift")
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.3)
+            svc.process_cpu_utilization = min(0.30, svc.process_cpu_utilization)
+            return (f"Load balancer weights reset on {target}. All replicas now receiving equal traffic share.", False)
+        return (f"Load rebalanced on {target} but underlying fault is not load-related.", False)
+
+    def _adjust_probe_timing(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Fix liveness probe timing to stop restart cycle."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Probe timing adjusted on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded — unnecessary.", True)
+        if target == fc.root_cause_service and fc.fault_type == "bad_deploy":
+            self._halt_fault_on(mesh, target, "bad_deploy")
+            svc.restart_count = max(0, svc.restart_count)
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.3)
+            return (f"Liveness probe timing updated on {target}. initialDelaySeconds=10, timeoutSeconds=8. Restart cycle halted.", False)
+        return (f"Probe timing adjusted on {target} but underlying fault is not probe-related.", False)
+
+    def _set_log_level(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig",
+        action: FirewatchAction, is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Set application log level on target."""
+        svc = mesh.services[target]
+        level = action.parameters.get("level", "INFO")
+        if level not in ("DEBUG", "INFO", "WARN", "ERROR"):
+            level = "INFO"
+        if is_wrong:
+            return (f"Log level set to {level} on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded — unnecessary.", True)
+        if target == fc.root_cause_service and fc.fault_type == "config_drift":
+            self._halt_fault_on(mesh, target, "config_drift")
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.3)
+            return (f"Log level set to {level} on {target}. Write rate dropping. Disk utilization stabilizing.", False)
+        return (f"Log level set to {level} on {target}. No effect on active fault.", False)
+
+    # ------------------------------------------------------------------
+    # Phase 2 Medium Tier Remediation (SPEC-05)
+    # ------------------------------------------------------------------
+
+    def _disable_retries(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Disable retries on target to break amplification loop."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Retries disabled on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded.", True)
+        svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.5)
+        svc.http_server_active_requests = max(30, svc.http_server_active_requests // 2)
+        return (f"Retries disabled on {target}. Amplification broken. Downstream load returning to baseline.", False)
+
+    def _configure_retry_backoff(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Configure exponential backoff with jitter on target."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Retry backoff configured on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded.", True)
+        return (f"Exponential backoff with jitter configured on {target}. Max retries: 3, base delay: 100ms, max delay: 10s.", False)
+
+    def _rollback_canary(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Roll back canary deployment, routing all traffic to stable."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Canary rolled back on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded.", True)
+        if target == fc.root_cause_service and fc.fault_type == "bad_deploy":
+            self._halt_fault_on(mesh, target, "bad_deploy")
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.2)
+            return (f"Canary rolled back on {target}. Traffic: 100% stable. Canary receiving 0%.", False)
+        svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.5)
+        return (f"Canary rolled back on {target} but fault is not canary-related.", False)
+
+    def _promote_canary(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Promote canary to 100% traffic. Catastrophic if canary is broken."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Canary promoted on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded.", True)
+        if target == fc.root_cause_service and fc.fault_type == "bad_deploy":
+            svc.http_server_error_rate = min(1.0, svc.http_server_error_rate + 0.40)
+            return (f"Canary promoted on {target}. Traffic: 100% canary. Error rate surging — WRONG ACTION for broken canary.", False)
+        return (f"Canary promoted on {target}. Traffic: 100% canary.", False)
+
+    def _redirect_reads_to_primary(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Route all reads to primary DB, eliminating stale-read errors."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Reads redirected to primary on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded.", True)
+        svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.2)
+        svc.http_server_request_duration_p99 = min(svc.http_server_request_duration_p99 * 1.4, 5.0)
+        return (f"Reads redirected to primary on {target}. Replica reads suspended. DataConsistencyExceptions clearing.", False)
+
+    def _force_replica_resync(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Trigger full replica resync from primary."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Replica resync on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded.", True)
+        if target == fc.root_cause_service and fc.fault_type == "network_partition":
+            self._halt_fault_on(mesh, target, "network_partition")
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.4)
+            return (f"Replica resync initiated on {target}. Full sync in progress. Estimated: 3 ticks.", False)
+        return (f"Replica resync initiated on {target} but fault is not replication-related.", False)
+
+    def _evict_cache_by_pattern(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Evict oversized/hot-key cache entries."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Cache eviction on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded.", True)
+        svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.5)
+        return (f"Cache eviction by pattern complete on {target}. Oversized keys removed. Hit rate recovering.", False)
+
+    def _increase_cache_memory(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Increase maxmemory allocation on cache."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Cache memory increased on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded.", True)
+        if target == fc.root_cause_service and fc.fault_type == "config_drift":
+            self._halt_fault_on(mesh, target, "config_drift")
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.2)
+            svc.process_memory_utilization = min(0.50, svc.process_memory_utilization * 0.6)
+            svc.process_memory_usage_bytes = int(svc.process_memory_utilization * svc.process_memory_limit_bytes)
+            return (f"Cache memory limit increased on {target}. Eviction pressure resolved.", False)
+        return (f"Cache memory increased on {target} but fault is not memory-related.", False)
+
+    def _complete_traffic_switch(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig",
+        action: FirewatchAction, is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Force all traffic to specified blue/green slot."""
+        svc = mesh.services[target]
+        slot = action.parameters.get("slot", "blue")
+        if slot not in ("blue", "green"):
+            slot = "blue"
+        if is_wrong:
+            return (f"Traffic switched to {slot} on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded.", True)
+        if target == fc.root_cause_service and fc.fault_type == "config_drift":
+            self._halt_fault_on(mesh, target, "config_drift")
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.2)
+            other = "green" if slot == "blue" else "blue"
+            return (f"Traffic fully switched to {slot} on {target}. {other} slot receiving 0% traffic.", False)
+        return (f"Traffic switched to {slot} on {target} but fault is not deployment-related.", False)
+
+    def _deregister_stale_instances(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Remove stale instances from service registry."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Stale instances deregistered from {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded.", True)
+        if target == fc.root_cause_service and fc.fault_type == "config_drift":
+            self._halt_fault_on(mesh, target, "config_drift")
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.1)
+            return (f"Stale instances deregistered from {target}. Dead instances removed. Registry healthy.", False)
+        return (f"Stale instances deregistered from {target} but fault is not registry-related.", False)
+
+    def _enable_deadline_propagation(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Enable gRPC deadline propagation to downstream calls."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Deadline propagation enabled on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded.", True)
+        if target == fc.root_cause_service and fc.fault_type == "bad_deploy":
+            self._halt_fault_on(mesh, target, "bad_deploy")
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.3)
+            return (f"gRPC deadline propagation enabled on {target}. Orphaned calls cancelling. Downstream thread pools draining.", False)
+        return (f"Deadline propagation enabled on {target} but fault is not deadline-related.", False)
+
+    # ------------------------------------------------------------------
+    # Phase 2 Hard Tier Remediation (SPEC-05) — Part 1
+    # ------------------------------------------------------------------
+
+    def _revert_network_policy(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig",
+    ) -> tuple[str, bool]:
+        """Remove last-applied network policy. guard_applies=False (gray failure)."""
+        svc = mesh.services[target]
+        if target == fc.root_cause_service and fc.fault_type == "network_partition":
+            self._halt_fault_on(mesh, target, "network_partition")
+            svc.http_server_request_duration_p99 = max(0.1, svc.http_server_request_duration_p99 * 0.3)
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.3)
+            return (f"Network policy reverted on {target}. Packet loss rule removed. TCP retransmit rate normalizing.", False)
+        return (f"Network policy reverted on {target}. No active packet loss policy found.", False)
+
+    def _disable_fallback_mode(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Force service to return errors instead of degraded fallback."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Fallback mode disabled on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded.", True)
+        svc.process_cpu_utilization = max(0.15, svc.process_cpu_utilization * 0.5)
+        return (f"Fallback mode disabled on {target}. Service returning errors instead of degraded fallback responses.", False)
+
+    def _request_quota_increase(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig",
+        action: FirewatchAction, is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Increase resource quota for specified dimension."""
+        svc = mesh.services[target]
+        resource = action.parameters.get("resource", "db_connections")
+        if resource not in ("gpu_compute", "bandwidth", "db_connections"):
+            resource = "db_connections"
+        if is_wrong:
+            return (f"Quota increase for {resource} on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded.", True)
+        if target == fc.root_cause_service:
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.4)
+            return (f"Quota increase approved for {resource} on {target}. quota_remaining_ratio increased by +0.30.", False)
+        return (f"Quota increase for {resource} on {target}. No effect on active fault.", False)
+
+    def _force_leader_election(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Trigger immediate leader re-election. Brief storm for 1 tick."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Leader election triggered on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded.", True)
+        svc.http_server_error_rate = min(1.0, svc.http_server_error_rate + 0.05)
+        return (f"Leader election triggered on {target}. Election in progress (1 tick). New leader elected after.", False)
+
+    def _isolate_minority_nodes(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Remove minority-partition nodes from serving traffic."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Minority nodes isolated on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded.", True)
+        svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.3)
+        return (f"Minority nodes isolated on {target}. Stale reads eliminated. Nodes removed from serving pool.", False)
+
+    def _redirect_config_reads_to_majority(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Pin config reads to majority-partition nodes."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Config reads pinned to majority on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded.", True)
+        svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.3)
+        return (f"Config reads pinned to majority partition on {target}. Minority nodes no longer serving reads.", False)
+
+    def _flush_diverged_keys(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Flush keys with write conflicts from cache cluster."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Diverged keys flushed on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded.", True)
+        svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.3)
+        return (f"Diverged keys flushed on {target}. Conflicted keys removed. Consistency restored.", False)
+
+    def _force_cluster_resync(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Force full cluster resync from canonical master set."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Cluster resync on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded.", True)
+        if target == fc.root_cause_service and fc.fault_type == "network_partition":
+            self._halt_fault_on(mesh, target, "network_partition")
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.3)
+            return (f"Full cluster resync initiated on {target}. Estimated completion: 3-5 ticks.", False)
+        return (f"Cluster resync initiated on {target} but fault is not partition-related.", False)
+
+    # ------------------------------------------------------------------
+    # Phase 2 Hard Tier Remediation (SPEC-05) — Part 2
+    # ------------------------------------------------------------------
+
+    def _enable_cache_warming(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Pre-populate cache with hot-key set."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Cache warming enabled on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded.", True)
+        if target == fc.root_cause_service and fc.fault_type == "config_drift":
+            self._halt_fault_on(mesh, target, "config_drift")
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.3)
+            svc.http_server_request_duration_p99 = max(0.1, svc.http_server_request_duration_p99 * 0.4)
+            return (f"Cache warming enabled on {target}. Hot keys pre-populated. Hit rate recovering.", False)
+        return (f"Cache warming enabled on {target} but fault is not cache-related.", False)
+
+    def _rate_limit_cache_misses(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Rate-limit backend queries triggered by cache misses."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Cache miss rate limit on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded.", True)
+        svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.5)
+        svc.http_server_active_requests = max(30, svc.http_server_active_requests // 2)
+        return (f"Cache miss rate limit applied on {target}. Backend query rate capped. Thundering herd contained.", False)
+
+    def _rebalance_az_traffic(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig",
+    ) -> tuple[str, bool]:
+        """Rebalance traffic across availability zones. guard_applies=False."""
+        svc = mesh.services[target]
+        svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.4)
+        svc.http_server_request_duration_p99 = max(0.1, svc.http_server_request_duration_p99 * 0.5)
+        return (f"AZ traffic rebalanced for {target}. Cross-zone routing equalized. Latency normalizing.", False)
+
+    def _scale_az_capacity(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig",
+    ) -> tuple[str, bool]:
+        """Add capacity in underprovisioned AZ. guard_applies=False."""
+        svc = mesh.services[target]
+        svc.http_server_active_requests = max(30, svc.http_server_active_requests // 2)
+        svc.process_cpu_utilization = max(0.15, svc.process_cpu_utilization * 0.5)
+        return (f"AZ capacity scaled for {target}. New instances provisioning. Request backlog draining.", False)
 
     # ------------------------------------------------------------------
     # Meta actions

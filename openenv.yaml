@@ -51,7 +51,7 @@ action_space:
     SRE diagnostic and remediation commands. Investigation actions reveal
     information without mutating state. Remediation actions mutate system state.
     System degrades autonomously each tick BEFORE the agent action is applied.
-    17 total actions: 10 original + 7 advanced diagnostic actions.
+    51 total actions: 17 Phase 1 + 33 Phase 2 + 1 reserved.
   properties:
     action_type:
       type: string
@@ -65,12 +65,51 @@ action_space:
         - trace_distributed_request
         - inspect_thread_pool
         - inspect_commit_diff
+        # Phase 2 investigation actions (SPEC-05)
+        - inspect_network_policy
+        - inspect_quota_usage
+        - inspect_consensus_state
+        - inspect_cluster_topology
+        # Phase 1 remediation actions
         - restart_service
         - rollback_deploy
         - revert_config
         - scale_replicas
         - circuit_break
         - traffic_shift
+        # Phase 2 Easy tier remediation (SPEC-05)
+        - enable_connection_throttle
+        - extend_timeout
+        - optimize_query
+        - rebalance_load
+        - adjust_probe_timing
+        - set_log_level
+        # Phase 2 Medium tier remediation (SPEC-05)
+        - disable_retries
+        - configure_retry_backoff
+        - rollback_canary
+        - promote_canary
+        - redirect_reads_to_primary
+        - force_replica_resync
+        - evict_cache_by_pattern
+        - increase_cache_memory
+        - complete_traffic_switch
+        - deregister_stale_instances
+        - enable_deadline_propagation
+        # Phase 2 Hard tier remediation (SPEC-05)
+        - revert_network_policy
+        - disable_fallback_mode
+        - request_quota_increase
+        - force_leader_election
+        - isolate_minority_nodes
+        - redirect_config_reads_to_majority
+        - flush_diverged_keys
+        - force_cluster_resync
+        - enable_cache_warming
+        - rate_limit_cache_misses
+        - rebalance_az_traffic
+        - scale_az_capacity
+        # Meta actions
         - declare_resolved
         - escalate
     target_service:

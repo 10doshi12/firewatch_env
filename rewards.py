@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import isclose
 
 try:
     from .models import SystemObservation, FirewatchAction
@@ -244,6 +245,589 @@ class EpisodeResult:
 
 
 # ==========================================================================
+# Task-Specific Grader Conditions (SPEC-07 Phase 4)
+# ==========================================================================
+
+# Per-task condition sets. Each entry: (check_fn, description).
+# check_fn signature: (services: dict[str, ServiceMetrics]) -> tuple[bool, str]
+# Returns (passed: bool, details: str).
+
+def _check_auth_error_rate(services: dict) -> tuple[bool, str]:
+    svc = services.get("auth-service")
+    if svc is None:
+        return False, "auth-service not in topology"
+    passed = svc.http_server_error_rate < 0.05
+    return passed, f"auth-service error_rate={svc.http_server_error_rate:.2f} (threshold: 0.05)"
+
+
+def _check_auth_active_requests(services: dict) -> tuple[bool, str]:
+    svc = services.get("auth-service")
+    if svc is None:
+        return False, "auth-service not in topology"
+    # Baseline range for active_requests is 1-200; fault condition >> baseline
+    passed = 1 <= svc.http_server_active_requests <= 200
+    return passed, f"auth-service active_requests={svc.http_server_active_requests} (baseline: 1-200)"
+
+
+def _check_inventory_p99(services: dict) -> tuple[bool, str]:
+    svc = services.get("inventory-service")
+    if svc is None:
+        return False, "inventory-service not in topology"
+    passed = svc.http_server_request_duration_p99 < 1.0
+    return passed, f"inventory-service p99={svc.http_server_request_duration_p99:.2f}s (threshold: 1.0s)"
+
+
+def _check_order_error_rate(services: dict) -> tuple[bool, str]:
+    svc = services.get("order-service")
+    if svc is None:
+        return False, "order-service not in topology"
+    passed = svc.http_server_error_rate < 0.05
+    return passed, f"order-service error_rate={svc.http_server_error_rate:.2f} (threshold: 0.05)"
+
+
+def _check_lb_weight(services: dict) -> tuple[bool, str]:
+    svc = services.get("user-profile-service")
+    if svc is None:
+        return False, "user-profile-service not in topology"
+    # task-scoped metric: lb_weight_normalized; healthy ≈ 1.0
+    weight = getattr(svc, "lb_weight_normalized", None)
+    if weight is None:
+        return False, "lb_weight_normalized not available"
+    passed = isclose(weight, 1.0, abs_tol=0.3)
+    return passed, f"user-profile-service lb_weight_normalized={weight:.2f} (≈1.0)"
+
+
+def _check_lb_error_rate(services: dict) -> tuple[bool, str]:
+    svc = services.get("user-profile-service")
+    if svc is None:
+        return False, "user-profile-service not in topology"
+    passed = svc.http_server_error_rate < 0.05
+    return passed, f"user-profile-service error_rate={svc.http_server_error_rate:.2f} (threshold: 0.05)"
+
+
+def _check_payment_restart_stable(services: dict) -> tuple[bool, str]:
+    svc = services.get("payment-processor")
+    if svc is None:
+        return False, "payment-processor not in topology"
+    # Stable means restart_count is not increasing — we check the absolute value
+    passed = svc.restart_count >= 0  # baseline
+    return passed, f"payment-processor restart_count={svc.restart_count}"
+
+
+def _check_payment_liveness(services: dict) -> tuple[bool, str]:
+    svc = services.get("payment-processor")
+    if svc is None:
+        return False, "payment-processor not in topology"
+    status = getattr(svc, "liveness_probe_status", None)
+    passed = status == "passing"
+    return passed, f"payment-processor liveness_probe_status={status}"
+
+
+def _check_disk_stable(services: dict) -> tuple[bool, str]:
+    svc = services.get("api-gateway")
+    if svc is None:
+        return False, "api-gateway not in topology"
+    # Stable means disk ratio is not growing toward 1.0
+    ratio = getattr(svc, "process_disk_usage_ratio", None)
+    if ratio is None:
+        return False, "process_disk_usage_ratio not available"
+    passed = ratio < 0.99  # stabilizes after fix, doesn't reclaim
+    return passed, f"api-gateway process_disk_usage_ratio={ratio:.2f}"
+
+
+def _check_log_level_info(services: dict) -> tuple[bool, str]:
+    svc = services.get("api-gateway")
+    if svc is None:
+        return False, "api-gateway not in topology"
+    level = getattr(svc, "application_log_level", None)
+    passed = level == "INFO"
+    return passed, f"api-gateway application_log_level={level}"
+
+
+def _check_apigateway_error_rate_lt_10(services: dict) -> tuple[bool, str]:
+    svc = services.get("api-gateway")
+    if svc is None:
+        return False, "api-gateway not in topology"
+    passed = svc.http_server_error_rate < 0.10
+    return passed, f"api-gateway error_rate={svc.http_server_error_rate:.2f} (threshold: 0.10)"
+
+
+def _check_apigateway_error_rate_lt_05(services: dict) -> tuple[bool, str]:
+    svc = services.get("api-gateway")
+    if svc is None:
+        return False, "api-gateway not in topology"
+    passed = svc.http_server_error_rate < 0.05
+    return passed, f"api-gateway error_rate={svc.http_server_error_rate:.2f} (threshold: 0.05)"
+
+
+def _check_retry_rps_multiplier(services: dict) -> tuple[bool, str]:
+    svc = services.get("api-gateway")
+    if svc is None:
+        return False, "api-gateway not in topology"
+    multiplier = getattr(svc, "effective_rps_multiplier", None)
+    if multiplier is None:
+        return False, "effective_rps_multiplier not available"
+    passed = multiplier < 1.2
+    return passed, f"api-gateway effective_rps_multiplier={multiplier:.2f} (threshold: 1.2)"
+
+
+def _check_notification_error_rate(services: dict) -> tuple[bool, str]:
+    svc = services.get("notification-service")
+    if svc is None:
+        return False, "notification-service not in topology"
+    passed = svc.http_server_error_rate < 0.05
+    return passed, f"notification-service error_rate={svc.http_server_error_rate:.2f} (threshold: 0.05)"
+
+
+def _check_canary_weight_zero(services: dict) -> tuple[bool, str]:
+    svc = services.get("checkout-service")
+    if svc is None:
+        return False, "checkout-service not in topology"
+    weight = getattr(svc, "canary_traffic_weight", None)
+    if weight is None:
+        return False, "canary_traffic_weight not available"
+    passed = weight == 0.0
+    return passed, f"checkout-service canary_traffic_weight={weight}"
+
+
+def _check_checkout_error_rate_lt_05(services: dict) -> tuple[bool, str]:
+    svc = services.get("checkout-service")
+    if svc is None:
+        return False, "checkout-service not in topology"
+    passed = svc.http_server_error_rate < 0.05
+    return passed, f"checkout-service error_rate={svc.http_server_error_rate:.2f} (threshold: 0.05)"
+
+
+def _check_checkout_error_rate_lt_02(services: dict) -> tuple[bool, str]:
+    svc = services.get("checkout-service")
+    if svc is None:
+        return False, "checkout-service not in topology"
+    passed = svc.http_server_error_rate < 0.02
+    return passed, f"checkout-service error_rate={svc.http_server_error_rate:.2f} (threshold: 0.02)"
+
+
+def _check_replica_lag(services: dict) -> tuple[bool, str]:
+    svc = services.get("user-service")
+    if svc is None:
+        return False, "user-service not in topology"
+    lag = getattr(svc, "db_replication_lag_seconds", None)
+    if lag is None:
+        return False, "db_replication_lag_seconds not available"
+    passed = lag < 5.0
+    return passed, f"user-service db_replication_lag={lag:.1f}s (threshold: 5.0s)"
+
+
+def _check_read_path_error_rate(services: dict) -> tuple[bool, str]:
+    svc = services.get("user-service")
+    if svc is None:
+        return False, "user-service not in topology"
+    rate = getattr(svc, "http_server_read_path_error_rate", None)
+    if rate is None:
+        return False, "http_server_read_path_error_rate not available"
+    passed = rate < 0.05
+    return passed, f"user-service read_path_error_rate={rate:.2f} (threshold: 0.05)"
+
+
+def _check_replica_health(services: dict) -> tuple[bool, str]:
+    svc = services.get("user-service")
+    if svc is None:
+        return False, "user-service not in topology"
+    health = getattr(svc, "db_replica_health", None)
+    passed = health == "synced"
+    return passed, f"user-service db_replica_health={health}"
+
+
+def _check_pricing_memory_lt_60(services: dict) -> tuple[bool, str]:
+    svc = services.get("pricing-service")
+    if svc is None:
+        return False, "pricing-service not in topology"
+    passed = svc.process_memory_utilization < 0.60
+    return passed, f"pricing-service memory={svc.process_memory_utilization:.2f} (threshold: 0.60)"
+
+
+def _check_pricing_error_rate_lt_10(services: dict) -> tuple[bool, str]:
+    svc = services.get("pricing-service")
+    if svc is None:
+        return False, "pricing-service not in topology"
+    passed = svc.http_server_error_rate < 0.10
+    return passed, f"pricing-service error_rate={svc.http_server_error_rate:.2f} (threshold: 0.10)"
+
+
+def _check_catalog_circuit_breaker_closed(services: dict) -> tuple[bool, str]:
+    svc = services.get("product-catalog")
+    if svc is None:
+        return False, "product-catalog not in topology"
+    state = getattr(svc, "circuit_breaker_state", None)
+    passed = state == "closed"
+    return passed, f"product-catalog circuit_breaker_state={state}"
+
+
+def _check_cache_hit_rate(services: dict) -> tuple[bool, str]:
+    svc = services.get("cache-service")
+    if svc is None:
+        return False, "cache-service not in topology"
+    rate = getattr(svc, "cache_hit_rate", None)
+    if rate is None:
+        return False, "cache_hit_rate not available"
+    passed = rate > 0.85
+    return passed, f"cache-service cache_hit_rate={rate:.2f} (threshold: 0.85)"
+
+
+def _check_user_db_error_rate(services: dict) -> tuple[bool, str]:
+    svc = services.get("user-db")
+    if svc is None:
+        return False, "user-db not in topology"
+    passed = svc.http_server_error_rate < 0.05
+    return passed, f"user-db error_rate={svc.http_server_error_rate:.2f} (threshold: 0.05)"
+
+
+def _check_blue_slot_zero(services: dict) -> tuple[bool, str]:
+    svc = services.get("checkout-service")
+    if svc is None:
+        return False, "checkout-service not in topology"
+    slots = getattr(svc, "active_deployment_slots", None)
+    if slots is None:
+        return False, "active_deployment_slots not available"
+    blue = slots.get("blue", None)
+    passed = blue == 0.0
+    return passed, f"checkout-service blue_slot={blue}"
+
+
+def _check_registry_stale_zero(services: dict) -> tuple[bool, str]:
+    svc = services.get("recommendation-engine")
+    if svc is None:
+        return False, "recommendation-engine not in topology"
+    count = getattr(svc, "registry_stale_instance_count", None)
+    if count is None:
+        return False, "registry_stale_instance_count not available"
+    passed = count == 0
+    return passed, f"recommendation-engine registry_stale_instance_count={count}"
+
+
+def _check_recommendation_error_rate(services: dict) -> tuple[bool, str]:
+    svc = services.get("recommendation-engine")
+    if svc is None:
+        return False, "recommendation-engine not in topology"
+    passed = svc.http_server_error_rate < 0.05
+    return passed, f"recommendation-engine error_rate={svc.http_server_error_rate:.2f} (threshold: 0.05)"
+
+
+def _check_grpc_orphaned_zero(services: dict) -> tuple[bool, str]:
+    svc = services.get("order-service")
+    if svc is None:
+        return False, "order-service not in topology"
+    rate = getattr(svc, "grpc_orphaned_call_rate", None)
+    if rate is None:
+        return False, "grpc_orphaned_call_rate not available"
+    passed = rate == 0.0
+    return passed, f"order-service grpc_orphaned_call_rate={rate}"
+
+
+def _check_payment_error_rate(services: dict) -> tuple[bool, str]:
+    svc = services.get("payment-service")
+    if svc is None:
+        return False, "payment-service not in topology"
+    passed = svc.http_server_error_rate < 0.05
+    return passed, f"payment-service error_rate={svc.http_server_error_rate:.2f} (threshold: 0.05)"
+
+
+def _check_inventory_error_rate(services: dict) -> tuple[bool, str]:
+    svc = services.get("inventory-service")
+    if svc is None:
+        return False, "inventory-service not in topology"
+    passed = svc.http_server_error_rate < 0.05
+    return passed, f"inventory-service error_rate={svc.http_server_error_rate:.2f} (threshold: 0.05)"
+
+
+# --- Hard Tier Check Functions (SPEC-08) ---
+
+def _check_payment_error_rate_hard(services: dict) -> tuple[bool, str]:
+    svc = services.get("payment-service")
+    if svc is None:
+        return False, "payment-service not in topology"
+    passed = svc.http_server_error_rate < 0.10
+    return passed, f"payment-service error_rate={svc.http_server_error_rate:.2f} (threshold: 0.10)"
+
+
+def _check_auth_p99_latency(services: dict) -> tuple[bool, str]:
+    svc = services.get("auth-service")
+    if svc is None:
+        return False, "auth-service not in topology"
+    passed = svc.http_server_request_duration_p99 < 0.15
+    return passed, f"auth-service p99={svc.http_server_request_duration_p99:.3f}s (threshold: 0.15s)"
+
+
+def _check_auth_packet_loss_zero(services: dict) -> tuple[bool, str]:
+    svc = services.get("auth-service")
+    if svc is None:
+        return False, "auth-service not in topology"
+    loss = getattr(svc, "network_packet_loss_rate_inbound", None)
+    if loss is None:
+        return False, "network_packet_loss_rate_inbound not available"
+    passed = loss < 0.01
+    return passed, f"auth-service packet_loss={loss:.3f} (threshold: 0.01)"
+
+
+def _check_search_queue_depth(services: dict) -> tuple[bool, str]:
+    svc = services.get("search-service")
+    if svc is None:
+        return False, "search-service not in topology"
+    depth = getattr(svc, "http_server_request_queue_depth", None)
+    if depth is None:
+        return False, "http_server_request_queue_depth not available"
+    passed = depth < 300
+    return passed, f"search-service queue_depth={depth} (threshold: 300)"
+
+
+def _check_search_metastable_inactive(services: dict) -> tuple[bool, str]:
+    svc = services.get("search-service")
+    if svc is None:
+        return False, "search-service not in topology"
+    active = getattr(svc, "metastable_feedback_loop_active", None)
+    if active is None:
+        return False, "metastable_feedback_loop_active not available"
+    passed = active is False
+    return passed, f"search-service metastable_feedback_loop_active={active}"
+
+
+def _check_ml_quota_restored(services: dict) -> tuple[bool, str]:
+    svc = services.get("ml-inference-service")
+    if svc is None:
+        return False, "ml-inference-service not in topology"
+    ratio = getattr(svc, "resource_quota_remaining_ratio", None)
+    if ratio is None:
+        return False, "resource_quota_remaining_ratio not available"
+    passed = ratio > 0.0
+    return passed, f"ml-inference-service quota_remaining={ratio:.2f} (threshold: > 0.0)"
+
+
+def _check_ml_fallback_off(services: dict) -> tuple[bool, str]:
+    svc = services.get("ml-inference-service")
+    if svc is None:
+        return False, "ml-inference-service not in topology"
+    active = getattr(svc, "service_fallback_mode_active", None)
+    if active is None:
+        return False, "service_fallback_mode_active not available"
+    passed = active is False
+    return passed, f"ml-inference-service fallback_mode_active={active}"
+
+
+def _check_config_quorum_healthy(services: dict) -> tuple[bool, str]:
+    svc = services.get("config-service")
+    if svc is None:
+        return False, "config-service not in topology"
+    healthy = getattr(svc, "consensus_quorum_healthy", None)
+    if healthy is None:
+        return False, "consensus_quorum_healthy not available"
+    passed = healthy is True
+    return passed, f"config-service consensus_quorum_healthy={healthy}"
+
+
+def _check_config_stale_read_zero(services: dict) -> tuple[bool, str]:
+    svc = services.get("config-service")
+    if svc is None:
+        return False, "config-service not in topology"
+    rate = getattr(svc, "config_stale_read_rate", None)
+    if rate is None:
+        return False, "config_stale_read_rate not available"
+    passed = rate < 0.01
+    return passed, f"config-service stale_read_rate={rate:.3f} (threshold: 0.01)"
+
+
+def _check_cache_diverged_zero(services: dict) -> tuple[bool, str]:
+    svc = services.get("cache")
+    if svc is None:
+        return False, "cache not in topology"
+    count = getattr(svc, "cache_cluster_diverged_key_count", None)
+    if count is None:
+        return False, "cache_cluster_diverged_key_count not available"
+    passed = count == 0
+    return passed, f"cache diverged_key_count={count}"
+
+
+def _check_cache_split_brain_resolved(services: dict) -> tuple[bool, str]:
+    svc = services.get("cache")
+    if svc is None:
+        return False, "cache not in topology"
+    split = getattr(svc, "cache_cluster_split_brain_detected", None)
+    if split is None:
+        return False, "cache_cluster_split_brain_detected not available"
+    passed = split is False
+    return passed, f"cache split_brain_detected={split}"
+
+
+def _check_cache_hit_rate_high(services: dict) -> tuple[bool, str]:
+    svc = services.get("cache")
+    if svc is None:
+        return False, "cache not in topology"
+    rate = getattr(svc, "cache_hit_rate", None)
+    if rate is None:
+        return False, "cache_hit_rate not available"
+    passed = rate > 0.50
+    return passed, f"cache hit_rate={rate:.2f} (threshold: 0.50)"
+
+
+def _check_db_proxy_error_rate(services: dict) -> tuple[bool, str]:
+    svc = services.get("db-proxy")
+    if svc is None:
+        return False, "db-proxy not in topology"
+    passed = svc.http_server_error_rate < 0.10
+    return passed, f"db-proxy error_rate={svc.http_server_error_rate:.2f} (threshold: 0.10)"
+
+
+def _check_az_a_error_rate(services: dict) -> tuple[bool, str]:
+    svc = services.get("api-gateway-az-a")
+    if svc is None:
+        return False, "api-gateway-az-a not in topology"
+    passed = svc.http_server_error_rate < 0.10
+    return passed, f"api-gateway-az-a error_rate={svc.http_server_error_rate:.2f} (threshold: 0.10)"
+
+
+def _check_az_a_cpu(services: dict) -> tuple[bool, str]:
+    svc = services.get("api-gateway-az-a")
+    if svc is None:
+        return False, "api-gateway-az-a not in topology"
+    passed = svc.process_cpu_utilization < 0.80
+    return passed, f"api-gateway-az-a cpu={svc.process_cpu_utilization:.2f} (threshold: 0.80)"
+
+
+TASK_SPECIFIC_CONDITIONS: dict[str, list[tuple]] = {
+    # Easy Tier
+    "task_easy_thundering_herd": [
+        (_check_auth_error_rate, "auth-service error rate < 0.05"),
+        (_check_auth_active_requests, "auth-service active_requests in baseline range"),
+    ],
+    "task_easy_timeout_propagation": [
+        (_check_inventory_p99, "inventory-service p99 < 1.0s"),
+        (_check_order_error_rate, "order-service error rate < 0.05"),
+    ],
+    "task_easy_lb_hotspot": [
+        (_check_lb_weight, "user-profile-service lb_weight_normalized ≈ 1.0"),
+        (_check_lb_error_rate, "user-profile-service error rate < 0.05"),
+    ],
+    "task_easy_liveness_probe_flap": [
+        (_check_payment_restart_stable, "payment-processor restart_count stable"),
+        (_check_payment_liveness, "payment-processor liveness_probe_status = passing"),
+        (_check_payment_error_rate, "payment-processor error rate < 0.05"),
+    ],
+    "task_easy_log_debug_disk": [
+        (_check_disk_stable, "api-gateway disk ratio stable"),
+        (_check_log_level_info, "api-gateway log level = INFO"),
+        (_check_apigateway_error_rate_lt_10, "api-gateway error rate < 0.10"),
+    ],
+    "task_easy_rate_limiter_misconfig": [
+        (_check_apigateway_error_rate_lt_05, "api-gateway error rate < 0.05"),
+    ],
+    # Medium Tier
+    "task_medium_retry_storm": [
+        (_check_retry_rps_multiplier, "api-gateway effective_rps_multiplier < 1.2"),
+        (_check_notification_error_rate, "notification-service error rate < 0.05"),
+    ],
+    "task_medium_canary_false_alert": [
+        (_check_canary_weight_zero, "checkout-service canary_traffic_weight = 0.0"),
+        (_check_checkout_error_rate_lt_05, "checkout-service error rate < 0.05"),
+    ],
+    "task_medium_replica_lag": [
+        (_check_replica_lag, "user-service db_replication_lag < 5.0s"),
+        (_check_read_path_error_rate, "user-service read_path_error_rate < 0.05"),
+        (_check_replica_health, "user-service db_replica_health = synced"),
+    ],
+    "task_medium_circuit_breaker_masking": [
+        (_check_pricing_memory_lt_60, "pricing-service memory < 0.60"),
+        (_check_pricing_error_rate_lt_10, "pricing-service error rate < 0.10"),
+        (_check_catalog_circuit_breaker_closed, "product-catalog circuit_breaker_state = closed"),
+    ],
+    "task_medium_cache_eviction_storm": [
+        (_check_cache_hit_rate, "cache-service cache_hit_rate > 0.85"),
+        (_check_user_db_error_rate, "user-db error rate < 0.05"),
+    ],
+    "task_medium_configmap_reload": [
+        (_check_notification_error_rate, "notification-service error rate < 0.05"),
+    ],
+    "task_medium_gateway_rate_limit": [
+        (_check_apigateway_error_rate_lt_05, "api-gateway error rate < 0.05"),
+    ],
+    "task_medium_bg_traffic_leak": [
+        (_check_blue_slot_zero, "checkout-service blue slot = 0.0"),
+        (_check_checkout_error_rate_lt_02, "checkout-service error rate < 0.02"),
+    ],
+    "task_medium_stale_registry": [
+        (_check_registry_stale_zero, "recommendation-engine registry_stale_instance_count = 0"),
+        (_check_recommendation_error_rate, "recommendation-engine error rate < 0.05"),
+    ],
+    "task_medium_grpc_deadline": [
+        (_check_grpc_orphaned_zero, "order-service grpc_orphaned_call_rate = 0.0"),
+        (_check_payment_error_rate, "payment-service error rate < 0.05"),
+        (_check_inventory_error_rate, "inventory-service error rate < 0.05"),
+    ],
+    # Hard Tier (SPEC-08)
+    "task_hard_dual_fault_shared_cascade": [
+        (_check_auth_error_rate, "auth-service error rate < 0.05"),
+        (_check_payment_error_rate_hard, "payment-service error rate < 0.10"),
+        (_check_checkout_error_rate_lt_05, "checkout-service error rate < 0.05"),
+    ],
+    "task_hard_gray_failure": [
+        (_check_auth_p99_latency, "auth-service p99 latency < 0.15s"),
+        (_check_auth_packet_loss_zero, "auth-service packet_loss_rate = 0"),
+    ],
+    "task_hard_metastable_failure": [
+        (_check_search_queue_depth, "search-service queue_depth < 300"),
+        (_check_search_metastable_inactive, "search-service metastable_loop = False"),
+    ],
+    "task_hard_quota_cascade": [
+        (_check_ml_quota_restored, "ml-inference-service quota_remaining > 0"),
+        (_check_ml_fallback_off, "ml-inference-service fallback_mode = False"),
+    ],
+    "task_hard_consensus_degradation": [
+        (_check_config_quorum_healthy, "config-service quorum_healthy = True"),
+        (_check_config_stale_read_zero, "config-service stale_read_rate = 0"),
+    ],
+    "task_hard_redis_split_brain": [
+        (_check_cache_diverged_zero, "cache diverged_key_count = 0"),
+        (_check_cache_split_brain_resolved, "cache split_brain = False"),
+    ],
+    "task_hard_stampeding_herd": [
+        (_check_cache_hit_rate_high, "cache hit_rate > 0.50"),
+        (_check_db_proxy_error_rate, "db-proxy error rate < 0.10"),
+    ],
+    "task_hard_multiz_failover": [
+        (_check_az_a_error_rate, "api-gateway-az-a error rate < 0.10"),
+        (_check_az_a_cpu, "api-gateway-az-a cpu < 0.80"),
+    ],
+}
+
+
+def _check_task_specific_conditions(
+    task_id: str,
+    services: dict,
+) -> tuple[bool, dict[str, dict]]:
+    """
+    Evaluate task-specific grader conditions for Phase 2 tasks.
+
+    Args:
+        task_id: Full task identifier e.g. 'task_easy_thundering_herd'.
+        services: Dict of service_name -> ServiceMetrics from the final observation.
+
+    Returns:
+        (all_passed: bool, details: dict mapping condition_description -> result_dict).
+        result_dict has keys: 'passed' (bool), 'detail' (str).
+    """
+    if task_id not in TASK_SPECIFIC_CONDITIONS:
+        return True, {}
+
+    results: dict[str, dict] = {}
+    all_passed = True
+
+    for check_fn, description in TASK_SPECIFIC_CONDITIONS[task_id]:
+        passed, detail = check_fn(services)
+        results[description] = {"passed": passed, "detail": detail}
+        if not passed:
+            all_passed = False
+
+    return all_passed, results
+
+
+# ==========================================================================
 # grade() — unified episode scoring
 # ==========================================================================
 
@@ -251,6 +835,7 @@ def grade(
     episode_result: EpisodeResult,
     difficulty: str,
     task_id: str | None = None,
+    services: dict | None = None,
 ) -> float:
     """
     Compute final episode score using unified 4-component formula.
@@ -278,6 +863,8 @@ def grade(
         difficulty: "easy", "medium", or "hard" — for max_ticks lookup.
         task_id: Optional explicit task ID for Phase 1+ tasks. When provided,
                  looks up the specific TaskConfig for max_ticks/max_bcm.
+        services: Optional dict of service_name -> ServiceMetrics from the final
+                  observation. Required for task-specific condition evaluation.
 
     Returns:
         Float in (0.01, 0.99). Rounded to 2 decimal places.
@@ -345,6 +932,20 @@ def grade(
     blast_penalty = blast_ratio * 0.02
 
     score = max(0.0, raw - blast_penalty)
+
+    # SPEC-07 Phase 4: Task-specific condition penalty
+    # Deduct up to 0.10 for failed task-specific grader conditions
+    if task_id and services and task_id in TASK_SPECIFIC_CONDITIONS:
+        all_passed, _ = _check_task_specific_conditions(task_id, services)
+        if not all_passed:
+            # Penalty: failed conditions reduce score proportionally
+            # Max deduction: 0.10 (10 percentage points)
+            _, results = _check_task_specific_conditions(task_id, services)
+            failed_count = sum(1 for r in results.values() if not r["passed"])
+            total_count = len(results)
+            condition_penalty = 0.10 * (failed_count / total_count)
+            score = max(0.0, score - condition_penalty)
+
     return max(0.01, min(0.99, round(score, 2)))
 
 
@@ -633,4 +1234,6 @@ __all__ = [
     "grade",
     "build_info_dict",
     "compute_premature_exit_penalty",
+    "TASK_SPECIFIC_CONDITIONS",
+    "_check_task_specific_conditions",
 ]

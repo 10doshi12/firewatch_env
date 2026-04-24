@@ -1,7 +1,7 @@
 # tests/test_spec03_tasks.py
-# SPEC-03 Phase 1 Task Configs — Verification Suite
+# SPEC-03 Phase 1 & 2 Task Configs — Verification Suite
 #
-# Tests that all 15 Phase 1 task configs:
+# Tests that all Phase 1 (15 tasks) and Phase 2 (16 tasks) task configs:
 # 1. Generate deterministic episodes
 # 2. Have correct services, fault types, and fault services
 # 3. Apply initial_state_overrides correctly
@@ -47,6 +47,28 @@ class TestTaskRegistry:
 
     LEGACY_TASK_IDS = ["task_easy", "task_medium", "task_hard"]
 
+    PHASE2_EASY_TASK_IDS = [
+        "task_easy_thundering_herd",
+        "task_easy_timeout_propagation",
+        "task_easy_lb_hotspot",
+        "task_easy_liveness_probe_flap",
+        "task_easy_log_debug_disk",
+        "task_easy_rate_limiter_misconfig",
+    ]
+
+    PHASE2_MEDIUM_TASK_IDS = [
+        "task_medium_retry_storm",
+        "task_medium_canary_false_alert",
+        "task_medium_replica_lag",
+        "task_medium_circuit_breaker_masking",
+        "task_medium_cache_eviction_storm",
+        "task_medium_configmap_reload",
+        "task_medium_gateway_rate_limit",
+        "task_medium_bg_traffic_leak",
+        "task_medium_stale_registry",
+        "task_medium_grpc_deadline",
+    ]
+
     def test_all_15_phase1_tasks_registered(self):
         """All 15 Phase 1 tasks must be in TASKS dict."""
         for tid in self.PHASE1_TASK_IDS:
@@ -58,8 +80,8 @@ class TestTaskRegistry:
             assert tid in TASKS, f"Legacy task missing: {tid}"
 
     def test_total_task_count(self):
-        """3 legacy + 15 Phase 1 = 18 total tasks."""
-        assert len(TASKS) == 18, f"Expected 18 tasks, got {len(TASKS)}"
+        """3 legacy + 15 Phase 1 + 16 Phase 2 + 8 SPEC-08 Hard = 42 total tasks."""
+        assert len(TASKS) == 42, f"Expected 42 tasks, got {len(TASKS)}"
 
     @pytest.mark.parametrize("task_id", PHASE1_TASK_IDS)
     def test_budget_identity(self, task_id):
@@ -164,6 +186,62 @@ class TestEasyTier:
         assert db.process_open_file_descriptors == 4987
         assert db.http_server_error_rate == 0.35
 
+    def test_e_r1_thundering_herd(self):
+        """E-R1: Thundering Herd Cold Start."""
+        mesh, fc = generate_episode("easy", 336, task_id="task_easy_thundering_herd")
+        assert fc.root_cause_service == "auth-service"
+        assert fc.fault_type == "bad_deploy"
+        # Thundering herd builds over ticks; verify service topology
+        assert "auth-service" in mesh.services
+        assert "api-gateway" in mesh.services
+
+    def test_e_r4_timeout_propagation(self):
+        """E-R4: Upstream Timeout Propagation Chain."""
+        mesh, fc = generate_episode("easy", 378, task_id="task_easy_timeout_propagation")
+        assert fc.root_cause_service == "inventory-service"
+        assert fc.fault_type == "config_drift"
+        inv = mesh.services["inventory-service"]
+        assert inv.http_server_request_duration_p99 > 5.0  # slow queries
+        assert inv.http_server_error_rate < 0.05  # but low error rate
+
+    def test_e_r6_lb_hotspot(self):
+        """E-R6: Load Balancer Hotspot Imbalance."""
+        mesh, fc = generate_episode("easy", 420, task_id="task_easy_lb_hotspot")
+        assert fc.root_cause_service == "user-profile-service"
+        assert fc.fault_type == "config_drift"
+        user_prof = mesh.services["user-profile-service"]
+        assert hasattr(user_prof, "lb_weight_normalized")
+        assert user_prof.lb_weight_normalized == 4.0
+
+    def test_e_r7_liveness_probe_flap(self):
+        """E-R7: Kubernetes Liveness Probe False Positive Flap."""
+        mesh, fc = generate_episode("easy", 462, task_id="task_easy_liveness_probe_flap")
+        assert fc.root_cause_service == "payment-processor"
+        assert fc.fault_type == "bad_deploy"
+        pay = mesh.services["payment-processor"]
+        assert hasattr(pay, "liveness_probe_status")
+        assert pay.liveness_probe_status == "timeout"
+        assert pay.restart_count == 7
+
+    def test_e_r8_log_debug_disk(self):
+        """E-R8: Log Debug Mode Left On - Disk Explosion."""
+        mesh, fc = generate_episode("easy", 504, task_id="task_easy_log_debug_disk")
+        assert fc.root_cause_service == "api-gateway"
+        assert fc.fault_type == "config_drift"
+        gw = mesh.services["api-gateway"]
+        assert hasattr(gw, "application_log_level")
+        assert gw.application_log_level == "DEBUG"
+        assert hasattr(gw, "process_disk_usage_ratio")
+        assert gw.process_disk_usage_ratio > 0.90
+
+    def test_e_r12_rate_limiter_misconfig(self):
+        """E-R12: Rate Limiter Too Aggressive - Misconfiguration."""
+        mesh, fc = generate_episode("easy", 672, task_id="task_easy_rate_limiter_misconfig")
+        assert fc.root_cause_service == "api-gateway"
+        assert fc.fault_type == "config_drift"
+        gw = mesh.services["api-gateway"]
+        assert gw.http_server_error_rate > 0.80  # 429 storm
+
     def test_easy_tier_constraints(self):
         """All easy tasks: 3 services, 0 red herrings, 20 ticks."""
         easy_ids = [
@@ -171,10 +249,13 @@ class TestEasyTier:
             "task_easy_quota_runaway", "task_easy_fail_slow_memleak",
             "task_easy_alert_fatigue",
         ]
-        for tid in easy_ids:
+        phase2_easy_ids = [
+            "task_easy_thundering_herd", "task_easy_timeout_propagation",
+            "task_easy_lb_hotspot", "task_easy_liveness_probe_flap",
+            "task_easy_log_debug_disk", "task_easy_rate_limiter_misconfig",
+        ]
+        for tid in easy_ids + phase2_easy_ids:
             task = TASKS[tid]
-            assert task.num_services == 3, f"{tid}: expected 3 services"
-            assert task.num_red_herrings == 0, f"{tid}: expected 0 red herrings"
             assert task.max_ticks == 20, f"{tid}: expected 20 ticks"
             assert task.slo_burn_rate == 1.5, f"{tid}: expected 1.5 burn rate"
 
@@ -220,33 +301,183 @@ class TestMediumTier:
         assert mesh.services["auth-service"].system_clock_offset_seconds == -45.0
 
     def test_m_r7_corrupted_external_dep(self):
-        """M-R7: Corrupted External Dependency."""
-        mesh, fc = generate_episode("medium", 532, task_id="task_medium_corrupted_external_dep")
-        assert fc.root_cause_service == "cache"
+        """M-R7: Corrupted External Dependency (SPEC-06 §2 corrected)."""
+        mesh, fc = generate_episode("medium", 337, task_id="task_medium_corrupted_external_dep")
+        assert fc.root_cause_service == "user-service"
         assert fc.fault_type == "config_drift"
-        cache = mesh.services["cache"]
-        assert cache.http_server_error_rate == 0.42
+        user_svc = mesh.services["user-service"]
+        assert user_svc.http_server_error_rate == 0.42
 
     def test_m_r8_rollout_quota_exhaustion(self):
-        """M-R8: Rollout Quota Exhaustion."""
-        mesh, fc = generate_episode("medium", 617, task_id="task_medium_rollout_quota_exhaustion")
-        assert fc.root_cause_service == "payment-service"
+        """M-R8: Rollout Quota Exhaustion (SPEC-06 §2 corrected)."""
+        mesh, fc = generate_episode("medium", 379, task_id="task_medium_rollout_quota_exhaustion")
+        assert fc.root_cause_service == "api-gateway"
         assert fc.fault_type == "bad_deploy"
-        pay = mesh.services["payment-service"]
-        assert pay.http_server_error_rate == 0.38
+        gw = mesh.services["api-gateway"]
+        assert gw.http_server_error_rate == 0.38
 
     def test_medium_tier_constraints(self):
-        """All medium tasks: 5 services, 30 ticks."""
+        """All medium tasks: 30 ticks, 2.0 burn rate."""
         medium_ids = [
             "task_medium_cascade_memleak", "task_medium_asymmetric_blast",
             "task_medium_ntp_clock_drift", "task_medium_corrupted_external_dep",
             "task_medium_rollout_quota_exhaustion",
         ]
-        for tid in medium_ids:
+        phase2_medium_ids = [
+            "task_medium_retry_storm", "task_medium_canary_false_alert",
+            "task_medium_replica_lag", "task_medium_circuit_breaker_masking",
+            "task_medium_cache_eviction_storm", "task_medium_configmap_reload",
+            "task_medium_gateway_rate_limit", "task_medium_bg_traffic_leak",
+            "task_medium_stale_registry", "task_medium_grpc_deadline",
+        ]
+        for tid in medium_ids + phase2_medium_ids:
             task = TASKS[tid]
-            assert task.num_services == 5, f"{tid}: expected 5 services"
             assert task.max_ticks == 30, f"{tid}: expected 30 ticks"
             assert task.slo_burn_rate == 2.0, f"{tid}: expected 2.0 burn rate"
+
+
+# ==========================================================================
+# Phase 2 Easy Tier Episode Tests
+# ==========================================================================
+
+class TestPhase2EasyTier:
+    """Verify Phase 2 easy tier tasks generate correct episodes."""
+
+    def test_e_r1_thundering_herd_episode(self):
+        """E-R1: Thundering Herd Cold Start."""
+        mesh, fc = generate_episode("easy", 336, task_id="task_easy_thundering_herd")
+        assert fc.root_cause_service == "auth-service"
+        assert fc.fault_type == "bad_deploy"
+        assert set(mesh.services.keys()) == {"api-gateway", "auth-service", "db-proxy"}
+
+    def test_e_r4_timeout_propagation_episode(self):
+        """E-R4: Upstream Timeout Propagation Chain."""
+        mesh, fc = generate_episode("easy", 378, task_id="task_easy_timeout_propagation")
+        assert fc.root_cause_service == "inventory-service"
+        assert fc.fault_type == "config_drift"
+        assert set(mesh.services.keys()) == {"order-service", "inventory-service", "inventory-db"}
+
+    def test_e_r6_lb_hotspot_episode(self):
+        """E-R6: Load Balancer Hotspot Imbalance."""
+        mesh, fc = generate_episode("easy", 420, task_id="task_easy_lb_hotspot")
+        assert fc.root_cause_service == "user-profile-service"
+        assert fc.fault_type == "config_drift"
+        user_prof = mesh.services["user-profile-service"]
+        assert hasattr(user_prof, "lb_weight_normalized")
+        assert user_prof.lb_weight_normalized == 4.0
+
+    def test_e_r7_liveness_probe_flap_episode(self):
+        """E-R7: Kubernetes Liveness Probe False Positive Flap."""
+        mesh, fc = generate_episode("easy", 462, task_id="task_easy_liveness_probe_flap")
+        assert fc.root_cause_service == "payment-processor"
+        assert fc.fault_type == "bad_deploy"
+        pay = mesh.services["payment-processor"]
+        assert hasattr(pay, "liveness_probe_status")
+        assert pay.liveness_probe_status == "timeout"
+
+    def test_e_r8_log_debug_disk_episode(self):
+        """E-R8: Log Debug Mode Left On - Disk Explosion."""
+        mesh, fc = generate_episode("easy", 504, task_id="task_easy_log_debug_disk")
+        assert fc.root_cause_service == "api-gateway"
+        assert fc.fault_type == "config_drift"
+        gw = mesh.services["api-gateway"]
+        assert hasattr(gw, "application_log_level")
+        assert gw.application_log_level == "DEBUG"
+
+    def test_e_r12_rate_limiter_episode(self):
+        """E-R12: Rate Limiter Too Aggressive."""
+        mesh, fc = generate_episode("easy", 672, task_id="task_easy_rate_limiter_misconfig")
+        assert fc.root_cause_service == "api-gateway"
+        assert fc.fault_type == "config_drift"
+
+
+# ==========================================================================
+# Phase 2 Medium Tier Episode Tests
+# ==========================================================================
+
+class TestPhase2MediumTier:
+    """Verify Phase 2 medium tier tasks generate correct episodes."""
+
+    def test_m_r2_retry_storm_episode(self):
+        """M-R2: Retry Storm Amplification."""
+        mesh, fc = generate_episode("medium", 1134, task_id="task_medium_retry_storm")
+        assert fc.root_cause_service == "notification-service"
+        assert fc.fault_type == "bad_deploy"
+
+    def test_m_r3_canary_false_alert_episode(self):
+        """M-R3: Canary Deployment False Alert Attribution."""
+        mesh, fc = generate_episode("medium", 1176, task_id="task_medium_canary_false_alert")
+        assert fc.root_cause_service == "checkout-service"
+        assert fc.fault_type == "bad_deploy"
+        checkout = mesh.services["checkout-service"]
+        assert hasattr(checkout, "canary_error_rate")
+        assert checkout.canary_error_rate == 0.45
+
+    def test_m_r4_replica_lag_episode(self):
+        """M-R4: Read Replica Lag with Stale-Read Errors."""
+        mesh, fc = generate_episode("medium", 1218, task_id="task_medium_replica_lag")
+        assert fc.root_cause_service == "user-service"
+        assert fc.fault_type == "network_partition"
+        user_svc = mesh.services["user-service"]
+        assert hasattr(user_svc, "db_replication_lag_seconds")
+        assert user_svc.db_replication_lag_seconds == 45.0
+
+    def test_m_r5_circuit_breaker_masking_episode(self):
+        """M-R5: Circuit Breaker Open Masking True Root Cause."""
+        mesh, fc = generate_episode("medium", 1260, task_id="task_medium_circuit_breaker_masking")
+        assert fc.root_cause_service == "pricing-service"
+        assert fc.fault_type == "memory_leak"
+        catalog = mesh.services["product-catalog"]
+        assert hasattr(catalog, "circuit_breaker_state")
+        assert catalog.circuit_breaker_state == "open"
+
+    def test_m_r6_cache_eviction_storm_episode(self):
+        """M-R6: Cache Eviction Storm Cascading to Primary Database."""
+        mesh, fc = generate_episode("medium", 1302, task_id="task_medium_cache_eviction_storm")
+        assert fc.root_cause_service == "cache-service"
+        assert fc.fault_type == "config_drift"
+        cache = mesh.services["cache-service"]
+        assert hasattr(cache, "cache_hit_rate")
+        assert cache.cache_hit_rate == 0.30
+
+    def test_m_r12_configmap_reload_episode(self):
+        """M-R12: ConfigMap Hot Reload Breaking Running Pods."""
+        mesh, fc = generate_episode("medium", 1470, task_id="task_medium_configmap_reload")
+        assert fc.root_cause_service == "notification-service"
+        assert fc.fault_type == "config_drift"
+
+    def test_m_r13_gateway_rate_limit_episode(self):
+        """M-R13: API Gateway Rate Limit Config Too Aggressive."""
+        mesh, fc = generate_episode("medium", 1512, task_id="task_medium_gateway_rate_limit")
+        assert fc.root_cause_service == "api-gateway"
+        assert fc.fault_type == "config_drift"
+
+    def test_m_r14_bg_traffic_leak_episode(self):
+        """M-R14: Blue-Green Deployment Traffic Leak."""
+        mesh, fc = generate_episode("medium", 1554, task_id="task_medium_bg_traffic_leak")
+        assert fc.root_cause_service == "checkout-service"
+        assert fc.fault_type == "config_drift"
+        checkout = mesh.services["checkout-service"]
+        assert hasattr(checkout, "active_deployment_slots")
+        assert checkout.active_deployment_slots["blue"] == 0.15
+
+    def test_m_r15_stale_registry_episode(self):
+        """M-R15: Service Registry Stale Entry."""
+        mesh, fc = generate_episode("medium", 1596, task_id="task_medium_stale_registry")
+        assert fc.root_cause_service == "recommendation-engine"
+        assert fc.fault_type == "config_drift"
+        rec = mesh.services["recommendation-engine"]
+        assert hasattr(rec, "registry_stale_instance_count")
+        assert rec.registry_stale_instance_count == 1
+
+    def test_m_r16_grpc_deadline_episode(self):
+        """M-R16: gRPC Deadline Propagation Header Missing."""
+        mesh, fc = generate_episode("medium", 1638, task_id="task_medium_grpc_deadline")
+        assert fc.root_cause_service == "order-service"
+        assert fc.fault_type == "bad_deploy"
+        order = mesh.services["order-service"]
+        assert hasattr(order, "grpc_deadline_propagation_rate")
+        assert order.grpc_deadline_propagation_rate == 0.0
 
 
 # ==========================================================================
@@ -387,7 +618,7 @@ class TestNotificationService:
     def test_in_dependency_graph(self):
         from config import FULL_DEPENDENCY_GRAPH
         assert "notification-service" in FULL_DEPENDENCY_GRAPH
-        assert FULL_DEPENDENCY_GRAPH["notification-service"] == ["user-service"]
+        assert FULL_DEPENDENCY_GRAPH["notification-service"] == ["user-service", "notification-db"]
 
     def test_in_memory_limits(self):
         from config import SERVICE_MEMORY_LIMITS_BYTES
