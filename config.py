@@ -64,6 +64,13 @@ ALL_SERVICES: list[str] = [
     "api-gateway-az-b",
     "payment-service-az-b",
     "user-service-az-b",
+    # --- Phase 3 additions (SPEC-10 §3) ---
+    "load-balancer",
+    "checkout-v2-service",
+    "batch-processor",
+    "feature-pipeline",
+    "feature-store",
+    "event-ingestion",
 ]
 
 # Complete dependency topology.
@@ -111,6 +118,13 @@ FULL_DEPENDENCY_GRAPH: dict[str, list[str]] = {
     "api-gateway-az-b": ["auth-service", "user-service"],
     "payment-service-az-b": ["db-proxy"],
     "user-service-az-b": ["db-proxy", "cache"],
+    # --- Phase 3 additions (SPEC-10 §4) ---
+    "load-balancer": ["api-gateway"],
+    "checkout-v2-service": ["payment-service", "auth-service"],
+    "batch-processor": ["db-proxy"],
+    "feature-pipeline": ["feature-store"],
+    "feature-store": ["db-proxy"],
+    "event-ingestion": ["feature-pipeline"],
 }
 
 
@@ -333,6 +347,10 @@ INVESTIGATION_ACTIONS: frozenset[str] = frozenset({
     "inspect_quota_usage",
     "inspect_consensus_state",
     "inspect_cluster_topology",
+    # Phase 3 investigation actions (SPEC-09)
+    "thread_dump",
+    "inspect_mtls_status",
+    "inspect_pipeline_topology",
 })
 
 
@@ -411,6 +429,36 @@ ACTION_REGISTRY: dict[str, ActionDef] = {
     # guard_applies=False: AZ-scoped target, no service error_rate
     "rebalance_az_traffic":      ActionDef(category="Remediation", guard_applies=False),
     "scale_az_capacity":         ActionDef(category="Remediation", guard_applies=False),
+    # --- Phase 3 Investigation actions (SPEC-09) ---
+    "thread_dump":               ActionDef(category="Investigation"),
+    "inspect_mtls_status":       ActionDef(category="Investigation"),
+    "inspect_pipeline_topology": ActionDef(category="Investigation"),
+    # --- Phase 3 Easy tier remediation (SPEC-09) ---
+    "inject_missing_env_var":    ActionDef(category="Remediation", guard_applies=True),
+    "restart_thread_pool":       ActionDef(category="Remediation", guard_applies=True),
+    "update_service_endpoint":   ActionDef(category="Remediation", guard_applies=True),
+    "force_ntp_sync":            ActionDef(category="Remediation", guard_applies=True),
+    "increase_cpu_limit":        ActionDef(category="Remediation", guard_applies=True),
+    "grant_rbac_permission":     ActionDef(category="Remediation", guard_applies=True),
+    "increase_max_streams":      ActionDef(category="Remediation", guard_applies=True),
+    # guard_applies=False: service at error_rate=0.0 before time bomb
+    "rotate_tls_certificate":    ActionDef(category="Remediation", guard_applies=False),
+    "rollback_deployment_rollout": ActionDef(category="Remediation", guard_applies=True),
+    # guard_applies=False: targets batch process with no error_rate metric
+    "evict_noisy_pod":           ActionDef(category="Remediation", guard_applies=False),
+    # --- Phase 3 Medium tier remediation (SPEC-09) ---
+    "pre_warm_service":          ActionDef(category="Remediation", guard_applies=True),
+    "stagger_connection_pool_reconnect": ActionDef(category="Remediation", guard_applies=True),
+    # guard_applies=False: AZ-scoped target
+    "drain_availability_zone":   ActionDef(category="Remediation", guard_applies=False),
+    "force_cert_rotation":       ActionDef(category="Remediation", guard_applies=True),
+    # --- Phase 3 Hard tier remediation (SPEC-09) ---
+    # guard_applies=False: H-R5 freshness-only task; error_rate=0 throughout
+    "restart_pipeline_job":      ActionDef(category="Remediation", guard_applies=False),
+    "flush_pipeline_stage":      ActionDef(category="Remediation", guard_applies=False),
+    "scale_pipeline_workers":    ActionDef(category="Remediation", guard_applies=False),
+    "rollback_proxy_upgrade":    ActionDef(category="Remediation", guard_applies=True),
+    "force_complete_proxy_upgrade": ActionDef(category="Remediation", guard_applies=True),
     # --- Meta actions (guard never applies) ---
     "declare_resolved":          ActionDef(category="Meta"),
     "escalate":                  ActionDef(category="Meta"),
@@ -513,6 +561,13 @@ SERVICE_MEMORY_LIMITS_BYTES: dict[str, int] = {
     "api-gateway-az-b": 536870912,          # 512 MB
     "payment-service-az-b": 1073741824,     # 1 GB
     "user-service-az-b": 536870912,         # 512 MB
+    # --- Phase 3 additions (SPEC-10 §3) ---
+    "load-balancer": 268435456,             # 256 MB
+    "checkout-v2-service": 1073741824,      # 1 GB
+    "batch-processor": 4294967296,          # 4 GB
+    "feature-pipeline": 4294967296,         # 4 GB
+    "feature-store": 2147483648,            # 2 GB
+    "event-ingestion": 1073741824,          # 1 GB
 }
 
 # --- Red Herring Degradation (PRD §8.6) ---
@@ -740,10 +795,10 @@ TASKS: dict[str, TaskConfig] = {
         name="Quota Exhaustion Runaway Client",
         difficulty="easy",
         fault_type="bad_deploy",
-        fault_service="api-gateway",
+        fault_service="notification-service",
         fault_speed=1.0,
-        seed=315,
-        services=("api-gateway", "auth-service", "db-proxy"),
+        seed=84,
+        services=("user-service", "notification-service", "cache"),
         red_herrings=(),
         num_services=3,
         num_red_herrings=0,
@@ -758,10 +813,13 @@ TASKS: dict[str, TaskConfig] = {
             "Correct path: fetch_logs → excessive request rate → rollback_deploy → declare_resolved."
         ),
         initial_state_overrides={
-            "api-gateway": {
-                "http_server_error_rate": 0.35,
-                "http_server_active_requests": 500,
+            "notification-service": {
                 "last_deployment_age_seconds": 180,
+                "http_server_error_rate": 0.22,
+            },
+            "user-service": {
+                "runtime_thread_pool_queue_depth": 847,
+                "http_server_active_requests": 312,
             },
         },
     ),
@@ -774,7 +832,7 @@ TASKS: dict[str, TaskConfig] = {
         fault_type="memory_leak",
         fault_service="payment-service",
         fault_speed=1.0,
-        seed=178,
+        seed=126,
         services=("api-gateway", "payment-service", "checkout-service"),
         red_herrings=(),
         num_services=3,
@@ -1276,10 +1334,10 @@ TASKS: dict[str, TaskConfig] = {
         name="Thundering Herd Cold Start",
         difficulty="easy",
         fault_type="bad_deploy",
-        fault_service="auth-service",
+        fault_service="session-service",
         fault_speed=1.0,
-        seed=336,
-        services=("api-gateway", "auth-service", "db-proxy"),
+        seed=301,
+        services=("load-balancer", "api-gateway", "session-service"),
         red_herrings=(),
         num_services=3,
         num_red_herrings=0,

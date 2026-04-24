@@ -360,6 +360,34 @@ class ServiceMesh:
                 self._apply_recovery_physics()
             self._propagate_cascade()
 
+        # --- Phase 3 Physics (SPEC-10) ---
+        if self.active_faults:
+            for fault in self.active_faults:
+                svc = self.services.get(fault.fault_service)
+                if svc:
+                    # Crashloop Backoff Countdown (E-S3)
+                    if fault.halted and getattr(svc, "runtime_crashloop_backoff_seconds", 0) > 0:
+                        svc.runtime_crashloop_backoff_seconds = max(0, svc.runtime_crashloop_backoff_seconds - SECONDS_PER_TICK)
+                        if svc.runtime_crashloop_backoff_seconds == 0:
+                            svc.restart_count = 0
+                            svc.http_server_error_rate = 0.01
+
+        for metrics in self.services.values():
+            # TLS Time Bomb (E-R18)
+            bomb_tick = getattr(metrics, "cert_expiry_bomb_tick", -1)
+            if bomb_tick == self.tick_count:
+                metrics.http_server_error_rate = 1.0
+                metrics.http_server_request_duration_p99 = 5.0
+            
+            # CPU Throttling Physics (E-R13)
+            throttle_rate = getattr(metrics, "process_cpu_throttle_rate", 0.0)
+            if throttle_rate > 0.0:
+                metrics.effective_rps_multiplier = max(0.1, 1.0 - throttle_rate)
+                
+            # Image Pull Backoff (E-R10)
+            if getattr(metrics, "image_pull_error", "") == "ImagePullBackOff":
+                metrics.restart_count = 0
+
         # 4. Update status on all services
         for svc_name, metrics in self.services.items():
             metrics.status = derive_status(
@@ -546,7 +574,8 @@ class ServiceMesh:
         speed = fault.fault_speed
 
         if svc is not None:
-            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate - speed * 0.15)
+            if svc.http_server_error_rate > 0.02:
+                svc.http_server_error_rate = max(0.01, svc.http_server_error_rate - speed * 0.15)
 
             target_lat = 0.1
             current_lat = svc.http_server_request_duration_p99

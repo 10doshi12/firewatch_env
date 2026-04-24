@@ -368,6 +368,76 @@ class ActionHandler:
         if at == "scale_az_capacity":
             return self._scale_az_capacity(target, mesh, fault_config)
 
+        # --- Phase 3 Investigation actions (SPEC-09) ---
+        if at == "thread_dump":
+            return self._thread_dump(target, mesh, fault_config)
+
+        if at == "inspect_mtls_status":
+            return self._inspect_mtls_status(target, mesh, fault_config)
+
+        if at == "inspect_pipeline_topology":
+            return self._inspect_pipeline_topology(target, mesh, fault_config)
+
+        # --- Phase 3 Easy tier remediation (SPEC-09) ---
+        if at == "inject_missing_env_var":
+            return self._inject_missing_env_var(target, mesh, fault_config, is_wrong)
+
+        if at == "restart_thread_pool":
+            return self._restart_thread_pool(target, mesh, fault_config, is_wrong)
+
+        if at == "update_service_endpoint":
+            return self._update_service_endpoint(target, mesh, fault_config, is_wrong)
+
+        if at == "force_ntp_sync":
+            return self._force_ntp_sync(target, mesh, fault_config, is_wrong)
+
+        if at == "increase_cpu_limit":
+            return self._increase_cpu_limit(target, mesh, fault_config, is_wrong)
+
+        if at == "grant_rbac_permission":
+            return self._grant_rbac_permission(target, mesh, fault_config, is_wrong)
+
+        if at == "increase_max_streams":
+            return self._increase_max_streams(target, mesh, fault_config, is_wrong)
+
+        if at == "rotate_tls_certificate":
+            return self._rotate_tls_certificate(target, mesh, fault_config)
+
+        if at == "rollback_deployment_rollout":
+            return self._rollback_deployment_rollout(target, mesh, fault_config, is_wrong)
+
+        if at == "evict_noisy_pod":
+            return self._evict_noisy_pod(target, mesh, fault_config)
+
+        # --- Phase 3 Medium tier remediation (SPEC-09) ---
+        if at == "pre_warm_service":
+            return self._pre_warm_service(target, mesh, fault_config, is_wrong)
+
+        if at == "stagger_connection_pool_reconnect":
+            return self._stagger_connection_pool_reconnect(target, mesh, fault_config, is_wrong)
+
+        if at == "drain_availability_zone":
+            return self._drain_availability_zone(target, mesh, fault_config)
+
+        if at == "force_cert_rotation":
+            return self._force_cert_rotation(target, mesh, fault_config, is_wrong)
+
+        # --- Phase 3 Hard tier remediation (SPEC-09) ---
+        if at == "restart_pipeline_job":
+            return self._restart_pipeline_job(target, mesh, fault_config)
+
+        if at == "flush_pipeline_stage":
+            return self._flush_pipeline_stage(target, mesh, fault_config)
+
+        if at == "scale_pipeline_workers":
+            return self._scale_pipeline_workers(target, mesh, fault_config)
+
+        if at == "rollback_proxy_upgrade":
+            return self._rollback_proxy_upgrade(target, mesh, fault_config, is_wrong)
+
+        if at == "force_complete_proxy_upgrade":
+            return self._force_complete_proxy_upgrade(target, mesh, fault_config, is_wrong)
+
         return (f"Unknown action type: {at}. No action taken.", False)
 
     # ------------------------------------------------------------------
@@ -1136,6 +1206,25 @@ class ActionHandler:
 
         if (
             target == fc.root_cause_service
+            and fc.fault_type == "config_drift"
+            and hasattr(svc, "sidecar_proxy_version")
+        ):
+            feedback = (
+                f"Git diff for {target} deployment (SHA: {svc.last_deployment_sha}):\n"
+                f'{{\n'
+                f'  "commit_hash": "{svc.last_deployment_sha}",\n'
+                f'  "files_changed": ["manifests/deployment.yaml", "envoyfilter.yaml"],\n'
+                f'  "config_delta": "+ proxy.istio.io/config: \\"{{ \\\\\\"proxyMetadata\\\\\\": {{ \\\\\\"TLS_VERSION\\\\\\": \\\\\\"TLS_1_2_ONLY\\\\\\" }} }}\\"",\n'
+                f'  "dependency_updates": [\n'
+                f'    {{"name": "istio-proxy", "old_version": "v1.28", "new_version": "v1.29"}}\n'
+                f'  ]\n'
+                f'}}\n'
+                f"[Analysis] Sidecar proxy version bump from v1.28 to v1.29 detected. "
+                f"This may cause TLS handshake failures with older v1.28 clients. "
+                f"Recommend rollback_proxy_upgrade or force_complete_proxy_upgrade."
+            )
+        elif (
+            target == fc.root_cause_service
             and fc.fault_type == "bad_deploy"
         ):
             # Select diff template based on service metrics
@@ -1634,6 +1723,343 @@ class ActionHandler:
         svc.http_server_active_requests = max(30, svc.http_server_active_requests // 2)
         svc.process_cpu_utilization = max(0.15, svc.process_cpu_utilization * 0.5)
         return (f"AZ capacity scaled for {target}. New instances provisioning. Request backlog draining.", False)
+
+    # ------------------------------------------------------------------
+    # Phase 3 Investigation actions (SPEC-09)
+    # ------------------------------------------------------------------
+
+    def _thread_dump(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig",
+    ) -> tuple[str, bool]:
+        """JVM thread dump: blocked thread stacks, deadlock detection. Does NOT modify state."""
+        svc = mesh.services[target]
+        if target == fc.root_cause_service and fc.fault_type == "bad_deploy":
+            blocked = getattr(svc, "runtime_blocked_thread_count", 12)
+            feedback = (
+                f"Thread dump for {target}:\n"
+                f'{{"runtime_thread_deadlock_detected": true, '
+                f'"blocked_thread_count": {blocked}, '
+                f'"deadlock_cycle": "Thread-A waiting for lock held by Thread-B, '
+                f'Thread-B waiting for lock held by Thread-A", '
+                f'"thread_pool_states": {{"http-worker": "BLOCKED", "db-pool": "BLOCKED"}}}}\n'
+                f"[Analysis] Deadlock detected. {blocked} threads blocked. "
+                f"Recommend restart_thread_pool to release."
+            )
+        else:
+            feedback = (
+                f"Thread dump for {target}:\n"
+                f'{{"runtime_thread_deadlock_detected": false, '
+                f'"blocked_thread_count": 0, '
+                f'"deadlock_cycle": null, '
+                f'"thread_pool_states": {{"http-worker": "RUNNABLE", "db-pool": "RUNNABLE"}}}}\n'
+                f"[Analysis] No deadlocks detected. All threads healthy."
+            )
+        return (feedback, False)
+
+    def _inspect_mtls_status(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig",
+    ) -> tuple[str, bool]:
+        """Returns mTLS certificate information for target's Envoy sidecar. Does NOT modify state."""
+        svc = mesh.services[target]
+        if target == fc.root_cause_service and fc.fault_type == "config_drift":
+            feedback = (
+                f"mTLS status for {target}:\n"
+                f'{{"cert_serial": "0xABCDEF1234", "expected_serial": "0x9876543210", '
+                f'"match": false, "sidecar_cert_rotation_status": "stale", '
+                f'"mtls_cert_expiry_seconds": 86400, '
+                f'"mtls_handshake_failure_rate": 0.35}}\n'
+                f"[Analysis] Certificate serial mismatch. Sidecar failed to pick up new CA cert. "
+                f"Recommend force_cert_rotation."
+            )
+        else:
+            feedback = (
+                f"mTLS status for {target}:\n"
+                f'{{"cert_serial": "0xABCDEF1234", "expected_serial": "0xABCDEF1234", '
+                f'"match": true, "sidecar_cert_rotation_status": "current", '
+                f'"mtls_cert_expiry_seconds": 7776000, '
+                f'"mtls_handshake_failure_rate": 0.0}}\n'
+                f"[Analysis] mTLS certificates healthy. No rotation needed."
+            )
+        return (feedback, False)
+
+    def _inspect_pipeline_topology(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig",
+    ) -> tuple[str, bool]:
+        """Returns full pipeline DAG with per-stage queue depth and throughput. Does NOT modify state."""
+        svc = mesh.services[target]
+        if target == fc.root_cause_service and fc.fault_type == "memory_leak":
+            freshness_lag = getattr(svc, "data_freshness_lag_seconds", 450.0)
+            feedback = (
+                f"Pipeline topology for {target}:\n"
+                f'{{"stages": ["ingest", "transform", "enrich", "load"], '
+                f'"queue_depth_per_stage": {{"ingest": 0, "transform": 2500, "enrich": 50, "load": 10}}, '
+                f'"throughput_ratio_per_stage": {{"ingest": 1.0, "transform": 0.3, "enrich": 1.0, "load": 1.0}}, '
+                f'"bottleneck_stage": "transform", '
+                f'"data_freshness_lag_seconds": {freshness_lag}}}\n'
+                f"[Analysis] Bottleneck at transform stage. Queue depth 2500, throughput ratio 0.3. "
+                f"Memory leak causing processing slowdown. Recommend restart_pipeline_job."
+            )
+        else:
+            feedback = (
+                f"Pipeline topology for {target}:\n"
+                f'{{"stages": ["ingest", "transform", "enrich", "load"], '
+                f'"queue_depth_per_stage": {{"ingest": 0, "transform": 5, "enrich": 2, "load": 0}}, '
+                f'"throughput_ratio_per_stage": {{"ingest": 1.0, "transform": 1.0, "enrich": 1.0, "load": 1.0}}, '
+                f'"bottleneck_stage": null, '
+                f'"data_freshness_lag_seconds": 2.0}}\n'
+                f"[Analysis] Pipeline healthy. No bottleneck detected."
+            )
+        return (feedback, False)
+
+    # ------------------------------------------------------------------
+    # Phase 3 Easy Tier Remediation (SPEC-09)
+    # ------------------------------------------------------------------
+
+    def _inject_missing_env_var(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Restore missing environment variable on target service."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Environment variable injected on {target} (error_rate {svc.http_server_error_rate:.4f}). Service was not degraded — unnecessary.", True)
+        if target == fc.root_cause_service and fc.fault_type == "bad_deploy":
+            self._halt_fault_on(mesh, target, "bad_deploy")
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.1)
+            svc.restart_count = max(0, svc.restart_count)
+            return (f"Environment variable injected on {target}. Startup failure resolved. CrashLoopBackOff cleared.", False)
+        return (f"Environment variable injected on {target}. No effect on active fault.", False)
+
+    def _restart_thread_pool(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Restart both thread pools on target, releasing all blocked threads."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Thread pools restarted on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded — unnecessary.", True)
+        if target == fc.root_cause_service and fc.fault_type == "bad_deploy":
+            self._halt_fault_on(mesh, target, "bad_deploy")
+            blocked = getattr(svc, "runtime_blocked_thread_count", 0)
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.1)
+            return (f"Thread pools restarted on {target}. Deadlock cleared. Blocked threads released: {blocked}.", False)
+        return (f"Thread pools restarted on {target}. No deadlock found — no effect on active fault.", False)
+
+    def _update_service_endpoint(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Update service endpoint configuration to correct DNS name."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Service endpoint updated on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded — unnecessary.", True)
+        if target == fc.root_cause_service and fc.fault_type == "config_drift":
+            self._halt_fault_on(mesh, target, "config_drift")
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.1)
+            return (f"Service endpoint updated on {target}. DNS: checkout-service.default.svc → checkout-v2-service.default.svc. NXDOMAIN errors clearing.", False)
+        return (f"Service endpoint updated on {target}. No DNS resolution issues found.", False)
+
+    def _force_ntp_sync(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Force NTP synchronization on target."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"NTP sync forced on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded — unnecessary.", True)
+        if target == fc.root_cause_service and fc.fault_type == "config_drift":
+            self._halt_fault_on(mesh, target, "config_drift")
+            old_offset = getattr(svc, "system_clock_offset_seconds", -45.0)
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.3)
+            return (f"NTP sync forced on {target}. Clock offset: {old_offset}s → correcting. Synced in ~2 ticks.", False)
+        return (f"NTP sync forced on {target}. Clock already synchronized — no effect.", False)
+
+    def _increase_cpu_limit(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Remove or increase CPU throttling limit on target."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"CPU limit increased on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded — unnecessary.", True)
+        if target == fc.root_cause_service and fc.fault_type == "config_drift":
+            self._halt_fault_on(mesh, target, "config_drift")
+            svc.process_cpu_utilization = max(0.15, svc.process_cpu_utilization * 0.3)
+            svc.http_server_request_duration_p99 = max(0.1, svc.http_server_request_duration_p99 * 0.2)
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.2)
+            return (f"CPU limit increased on {target}. limits.cpu: 100m → 1000m. Throttle rate normalizing.", False)
+        return (f"CPU limit increased on {target}. No CPU throttling detected — no effect.", False)
+
+    def _grant_rbac_permission(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Grant required RBAC permission to service's ServiceAccount."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"RBAC permission granted on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded — unnecessary.", True)
+        if target == fc.root_cause_service and fc.fault_type == "config_drift":
+            self._halt_fault_on(mesh, target, "config_drift")
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.05)
+            return (f"RBAC permission granted on {target}. ServiceAccount can now access configmaps in production namespace.", False)
+        return (f"RBAC permission granted on {target}. ServiceAccount already has required permissions.", False)
+
+    def _increase_max_streams(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Increase http2_max_concurrent_streams on target."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"HTTP/2 max streams increased on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded — unnecessary.", True)
+        if target == fc.root_cause_service and fc.fault_type == "config_drift":
+            self._halt_fault_on(mesh, target, "config_drift")
+            svc.http_server_request_duration_p99 = max(0.1, svc.http_server_request_duration_p99 * 0.3)
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.2)
+            return (f"HTTP/2 max concurrent streams increased on {target}. New limit: 500. Queued requests draining.", False)
+        return (f"HTTP/2 max streams increased on {target}. No stream contention detected.", False)
+
+    def _rotate_tls_certificate(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig",
+    ) -> tuple[str, bool]:
+        """Issue and deploy new TLS certificate. guard_applies=False."""
+        svc = mesh.services[target]
+        if target == fc.root_cause_service and fc.fault_type == "config_drift":
+            self._halt_fault_on(mesh, target, "config_drift")
+            svc.http_server_error_rate = max(0.0, svc.http_server_error_rate * 0.1)
+            return (f"TLS certificate rotated on {target}. New cert issued. Expiry: 90 days. cert-manager confirmed.", False)
+        return (f"TLS certificate rotated on {target}. Certificate was not expired — no effect on fault.", False)
+
+    def _rollback_deployment_rollout(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Abort in-progress Kubernetes rollout, revert to previous stable version."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Deployment rollout aborted on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded — unnecessary.", True)
+        if target == fc.root_cause_service and fc.fault_type == "bad_deploy":
+            self._halt_fault_on(mesh, target, "bad_deploy")
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.1)
+            return (f"Deployment rollout aborted on {target}. All pods reverted to v2.3.0. Rollout progress: 0%.", False)
+        return (f"Deployment rollout aborted on {target}. No in-progress rollout found.", False)
+
+    def _evict_noisy_pod(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig",
+    ) -> tuple[str, bool]:
+        """Evict noisy neighbor pod from node. guard_applies=False."""
+        svc = mesh.services[target]
+        if target == fc.root_cause_service and fc.fault_type == "oom":
+            self._halt_fault_on(mesh, target, "oom")
+            svc.process_memory_utilization = max(0.20, svc.process_memory_utilization * 0.3)
+            svc.process_memory_usage_bytes = int(svc.process_memory_utilization * svc.process_memory_limit_bytes)
+            return (f"Pod {target} evicted from node. Node memory pressure: active → resolving. Node available memory recovering.", False)
+        return (f"Pod {target} evicted from node. No memory pressure detected on this node.", False)
+
+    # ------------------------------------------------------------------
+    # Phase 3 Medium Tier Remediation (SPEC-09)
+    # ------------------------------------------------------------------
+
+    def _pre_warm_service(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Schedule additional replicas and send synthetic warmup traffic. Partial fix."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Service pre-warming on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded — unnecessary.", True)
+        svc.http_server_request_duration_p99 = max(0.1, svc.http_server_request_duration_p99 * 0.5)
+        svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.5)
+        return (f"Service pre-warming initiated on {target}. Additional replicas scheduled. Synthetic traffic warming model. Cold start window reduced by ~50%.", False)
+
+
+    def _stagger_connection_pool_reconnect(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Sequence pool reconnects with 2-second delays between each service."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Connection pool reconnect staggered on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded — unnecessary.", True)
+        if target == fc.root_cause_service and fc.fault_type == "config_drift":
+            self._halt_fault_on(mesh, target, "config_drift")
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.3)
+            return (f"Connection pool reconnect staggered on {target}. 5 services reconnecting with 2s delays. Pool initialization in progress.", False)
+        return (f"Connection pool reconnect staggered on {target}. No reconnection storm detected.", False)
+
+    def _drain_availability_zone(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig",
+    ) -> tuple[str, bool]:
+        """Set lb_az_traffic_weight=0 for target AZ. guard_applies=False."""
+        svc = mesh.services[target]
+        if target == fc.root_cause_service and fc.fault_type == "network_partition":
+            self._halt_fault_on(mesh, target, "network_partition")
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.1)
+            return (f"AZ {target} drained. Traffic weight: 0.33 → 0. All traffic redirected to healthy availability zones.", False)
+        svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.5)
+        return (f"AZ {target} drained. Traffic weight set to 0. No active fault in this AZ.", False)
+
+    def _force_cert_rotation(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Force Envoy sidecar to fetch new certificate from Istio CA."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"mTLS certificate rotation forced on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded — unnecessary.", True)
+        if target == fc.root_cause_service and fc.fault_type == "config_drift":
+            self._halt_fault_on(mesh, target, "config_drift")
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.1)
+            return (f"mTLS certificate rotation forced on {target}. Sidecar fetching new cert from Istio CA. Handshake failures clearing.", False)
+        return (f"mTLS certificate rotation forced on {target}. Sidecar certificate already current.", False)
+
+    # ------------------------------------------------------------------
+    # Phase 3 Hard Tier Remediation (SPEC-09)
+    # ------------------------------------------------------------------
+
+    def _restart_pipeline_job(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig",
+    ) -> tuple[str, bool]:
+        """Clear memory leak on pipeline stage. guard_applies=False."""
+        svc = mesh.services[target]
+        if target == fc.root_cause_service and fc.fault_type == "memory_leak":
+            self._halt_fault_on(mesh, target, "memory_leak")
+            svc.process_memory_utilization = max(0.20, svc.process_memory_utilization * 0.3)
+            svc.process_memory_usage_bytes = int(svc.process_memory_utilization * svc.process_memory_limit_bytes)
+            return (f"Pipeline job restarted on {target}. Memory cleared. Processing rate recovering. Queue draining.", False)
+        return (f"Pipeline job restarted on {target}. No memory leak detected on this stage.", False)
+
+    def _flush_pipeline_stage(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig",
+    ) -> tuple[str, bool]:
+        """Drop all queued events at target stage. DATA LOSS. guard_applies=False."""
+        svc = mesh.services[target]
+        queue_depth = getattr(svc, "pipeline_queue_depth", 2500)
+        svc.http_server_error_rate = max(0.0, svc.http_server_error_rate * 0.5)
+        return (f"Pipeline stage flushed on {target}. WARNING: DATA LOSS. {queue_depth} queued events discarded. Freshness lag: → 0s.", False)
+
+    def _scale_pipeline_workers(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig",
+    ) -> tuple[str, bool]:
+        """Increase processing capacity by +40%. Does not fix memory leak. guard_applies=False."""
+        svc = mesh.services[target]
+        svc.http_server_active_requests = max(30, int(svc.http_server_active_requests * 0.7))
+        return (f"Pipeline workers scaled on {target}. Capacity +40%. Throughput ratio improving. Memory leak still active.", False)
+
+    def _rollback_proxy_upgrade(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Revert sidecar proxy to previous version (v1.28)."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Sidecar proxy rolled back on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded — unnecessary.", True)
+        if target == fc.root_cause_service and fc.fault_type == "config_drift":
+            self._halt_fault_on(mesh, target, "config_drift")
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.1)
+            return (f"Sidecar proxy rolled back to v1.28 on {target}. TLS 1.1 compatibility restored. Handshake failures clearing.", False)
+        return (f"Sidecar proxy rolled back on {target}. No TLS version incompatibility detected.", False)
+
+    def _force_complete_proxy_upgrade(
+        self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
+    ) -> tuple[str, bool]:
+        """Force remaining old-proxy instances to upgrade to v1.29."""
+        svc = mesh.services[target]
+        if is_wrong:
+            return (f"Proxy upgrade forced on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded — unnecessary.", True)
+        if target == fc.root_cause_service and fc.fault_type == "config_drift":
+            self._halt_fault_on(mesh, target, "config_drift")
+            svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.2)
+            return (f"Proxy upgrade forced to completion on {target}. All sidecars now v1.29. TLS 1.1 eliminated. Compatibility: 100%.", False)
+        return (f"Proxy upgrade forced on {target}. All instances already on latest version.", False)
 
     # ------------------------------------------------------------------
     # Meta actions

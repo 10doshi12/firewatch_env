@@ -124,6 +124,32 @@ ActionType = Literal[
     "rate_limit_cache_misses",
     "rebalance_az_traffic",
     "scale_az_capacity",
+    # Phase 3 investigation actions (SPEC-09)
+    "thread_dump",
+    "inspect_mtls_status",
+    "inspect_pipeline_topology",
+    # Phase 3 Easy tier remediation actions (SPEC-09)
+    "inject_missing_env_var",
+    "restart_thread_pool",
+    "update_service_endpoint",
+    "force_ntp_sync",
+    "increase_cpu_limit",
+    "grant_rbac_permission",
+    "increase_max_streams",
+    "rotate_tls_certificate",
+    "rollback_deployment_rollout",
+    "evict_noisy_pod",
+    # Phase 3 Medium tier remediation actions (SPEC-09)
+    "pre_warm_service",
+    "stagger_connection_pool_reconnect",
+    "drain_availability_zone",
+    "force_cert_rotation",
+    # Phase 3 Hard tier remediation actions (SPEC-09)
+    "restart_pipeline_job",
+    "flush_pipeline_stage",
+    "scale_pipeline_workers",
+    "rollback_proxy_upgrade",
+    "force_complete_proxy_upgrade",
     # Meta actions — episode control
     "declare_resolved",
     "escalate",

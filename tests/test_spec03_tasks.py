@@ -161,16 +161,17 @@ class TestEasyTier:
 
     def test_e_r2_quota_runaway(self):
         """E-R2: Quota Exhaustion Runaway Client."""
-        mesh, fc = generate_episode("easy", 315, task_id="task_easy_quota_runaway")
-        assert fc.root_cause_service == "api-gateway"
+        mesh, fc = generate_episode("easy", 84, task_id="task_easy_quota_runaway")
+        assert fc.root_cause_service == "notification-service"
         assert fc.fault_type == "bad_deploy"
-        gw = mesh.services["api-gateway"]
-        assert gw.http_server_error_rate == 0.35
-        assert gw.http_server_active_requests == 500
+        ns = mesh.services["notification-service"]
+        assert ns.http_server_error_rate == 0.22
+        user = mesh.services["user-service"]
+        assert user.http_server_active_requests == 312
 
     def test_e_r3_fail_slow_memleak(self):
         """E-R3: Fail-Slow Memory Leak."""
-        mesh, fc = generate_episode("easy", 178, task_id="task_easy_fail_slow_memleak")
+        mesh, fc = generate_episode("easy", 126, task_id="task_easy_fail_slow_memleak")
         assert fc.root_cause_service == "payment-service"
         assert fc.fault_type == "memory_leak"
         pay = mesh.services["payment-service"]
@@ -188,12 +189,12 @@ class TestEasyTier:
 
     def test_e_r1_thundering_herd(self):
         """E-R1: Thundering Herd Cold Start."""
-        mesh, fc = generate_episode("easy", 336, task_id="task_easy_thundering_herd")
-        assert fc.root_cause_service == "auth-service"
+        mesh, fc = generate_episode("easy", 301, task_id="task_easy_thundering_herd")
+        assert fc.root_cause_service == "session-service"
         assert fc.fault_type == "bad_deploy"
         # Thundering herd builds over ticks; verify service topology
-        assert "auth-service" in mesh.services
-        assert "api-gateway" in mesh.services
+        assert "session-service" in mesh.services
+        assert "load-balancer" in mesh.services
 
     def test_e_r4_timeout_propagation(self):
         """E-R4: Upstream Timeout Propagation Chain."""
@@ -345,10 +346,10 @@ class TestPhase2EasyTier:
 
     def test_e_r1_thundering_herd_episode(self):
         """E-R1: Thundering Herd Cold Start."""
-        mesh, fc = generate_episode("easy", 336, task_id="task_easy_thundering_herd")
-        assert fc.root_cause_service == "auth-service"
+        mesh, fc = generate_episode("easy", 301, task_id="task_easy_thundering_herd")
+        assert fc.root_cause_service == "session-service"
         assert fc.fault_type == "bad_deploy"
-        assert set(mesh.services.keys()) == {"api-gateway", "auth-service", "db-proxy"}
+        assert set(mesh.services.keys()) == {"load-balancer", "api-gateway", "session-service"}
 
     def test_e_r4_timeout_propagation_episode(self):
         """E-R4: Upstream Timeout Propagation Chain."""
@@ -595,8 +596,8 @@ class TestSeedLookup:
 
     def test_seed_lookup_finds_correct_task(self):
         """Calling generate_episode with matching (difficulty, seed) finds the task."""
-        mesh, fc = generate_episode("easy", 315)  # E-R2 seed
-        assert fc.root_cause_service == "api-gateway"
+        mesh, fc = generate_episode("easy", 84)  # E-R2 seed
+        assert fc.root_cause_service == "notification-service"
         assert fc.fault_type == "bad_deploy"
 
     def test_seed_lookup_dual_fault(self):
