@@ -2009,57 +2009,102 @@ class ActionHandler:
     def _restart_pipeline_job(
         self, target: str, mesh: "ServiceMesh", fc: "FaultConfig",
     ) -> tuple[str, bool]:
-        """Clear memory leak on pipeline stage. guard_applies=False."""
+        """Clear memory leak on pipeline stage. guard_applies=False.
+
+        SPEC-12 H-R5: Halts memory leak. Processing rate recovers +50% per tick.
+        Queue drains as processing_rate > ingestion_rate.
+        """
         svc = mesh.services[target]
         if target == fc.root_cause_service and fc.fault_type == "memory_leak":
             self._halt_fault_on(mesh, target, "memory_leak")
             svc.process_memory_utilization = max(0.20, svc.process_memory_utilization * 0.3)
             svc.process_memory_usage_bytes = int(svc.process_memory_utilization * svc.process_memory_limit_bytes)
-            return (f"Pipeline job restarted on {target}. Memory cleared. Processing rate recovering. Queue draining.", False)
+            # Recover processing rate: +50% boost
+            processing = getattr(svc, "pipeline_processing_rate_events_per_second", None)
+            if processing is not None:
+                svc.pipeline_processing_rate_events_per_second = processing * 1.5
+            return (f"Pipeline job restarted on {target}. Memory cleared. Processing rate recovering +50%. Queue draining.", False)
         return (f"Pipeline job restarted on {target}. No memory leak detected on this stage.", False)
 
     def _flush_pipeline_stage(
         self, target: str, mesh: "ServiceMesh", fc: "FaultConfig",
     ) -> tuple[str, bool]:
-        """Drop all queued events at target stage. DATA LOSS. guard_applies=False."""
+        """Drop all queued events at target stage. DATA LOSS. guard_applies=False.
+
+        SPEC-12 H-R5: pipeline_queue_depth → 0, data_freshness_lag → 0 immediately.
+        Memory leak persists — queue grows again unless combined with restart_pipeline_job.
+        """
         svc = mesh.services[target]
         queue_depth = getattr(svc, "pipeline_queue_depth", 2500)
+        # Zero queue and freshness lag immediately
+        svc.pipeline_queue_depth = 0
+        svc.data_freshness_lag_seconds = 0.0
+        svc.feature_vector_age_seconds_p99 = 0.0
         svc.http_server_error_rate = max(0.0, svc.http_server_error_rate * 0.5)
         return (f"Pipeline stage flushed on {target}. WARNING: DATA LOSS. {queue_depth} queued events discarded. Freshness lag: → 0s.", False)
 
     def _scale_pipeline_workers(
         self, target: str, mesh: "ServiceMesh", fc: "FaultConfig",
     ) -> tuple[str, bool]:
-        """Increase processing capacity by +40%. Does not fix memory leak. guard_applies=False."""
+        """Increase processing capacity by +40%. Does not fix memory leak. guard_applies=False.
+
+        SPEC-12 H-R5: +40% processing rate. Queue growth slows but doesn't stop.
+        Buys ~3 ticks before queue reaches same depth.
+        """
         svc = mesh.services[target]
+        # Increase processing rate by 40%
+        processing = getattr(svc, "pipeline_processing_rate_events_per_second", None)
+        if processing is not None:
+            svc.pipeline_processing_rate_events_per_second = processing * 1.4
         svc.http_server_active_requests = max(30, int(svc.http_server_active_requests * 0.7))
         return (f"Pipeline workers scaled on {target}. Capacity +40%. Throughput ratio improving. Memory leak still active.", False)
 
     def _rollback_proxy_upgrade(
         self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
     ) -> tuple[str, bool]:
-        """Revert sidecar proxy to previous version (v1.28)."""
+        """Revert sidecar proxy to previous version (v1.28).
+
+        SPEC-12 H-R12: Restores TLS1.1 compatibility. Clears cipher mismatch.
+        Also recovers downstream checkout-service error rate.
+        """
         svc = mesh.services[target]
         if is_wrong:
             return (f"Sidecar proxy rolled back on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded — unnecessary.", True)
         if target == fc.root_cause_service and fc.fault_type == "config_drift":
             self._halt_fault_on(mesh, target, "config_drift")
             svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.1)
+            # Restore proxy/TLS metrics
+            svc.sidecar_proxy_version = "v1.28"
+            svc.sidecar_tls_version = "TLS1.1"
+            svc.mtls_cipher_compatibility = True
+            # Recover downstream checkout-service
+            checkout = mesh.services.get("checkout-service")
+            if checkout:
+                checkout.http_server_error_rate = max(0.01, checkout.http_server_error_rate * 0.15)
             return (f"Sidecar proxy rolled back to v1.28 on {target}. TLS 1.1 compatibility restored. Handshake failures clearing.", False)
         return (f"Sidecar proxy rolled back on {target}. No TLS version incompatibility detected.", False)
 
     def _force_complete_proxy_upgrade(
         self, target: str, mesh: "ServiceMesh", fc: "FaultConfig", is_wrong: bool,
     ) -> tuple[str, bool]:
-        """Force remaining old-proxy instances to upgrade to v1.29."""
+        """Force remaining old-proxy instances to upgrade to v1.29.
+
+        SPEC-12 H-R12: Upgrades target to v1.29/TLS1.2. Restores cipher compatibility.
+        """
         svc = mesh.services[target]
         if is_wrong:
             return (f"Proxy upgrade forced on {target} (error_rate {svc.http_server_error_rate:.4f}). Not degraded — unnecessary.", True)
+        # Upgrade proxy version and TLS
+        svc.sidecar_proxy_version = "v1.29"
+        svc.sidecar_tls_version = "TLS1.2"
+        svc.mtls_cipher_compatibility = True
         if target == fc.root_cause_service and fc.fault_type == "config_drift":
             self._halt_fault_on(mesh, target, "config_drift")
             svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.2)
             return (f"Proxy upgrade forced to completion on {target}. All sidecars now v1.29. TLS 1.1 eliminated. Compatibility: 100%.", False)
-        return (f"Proxy upgrade forced on {target}. All instances already on latest version.", False)
+        # Non-root service: still upgrade proxy (alternative path for auth/user)
+        svc.http_server_error_rate = max(0.01, svc.http_server_error_rate * 0.3)
+        return (f"Proxy upgrade forced on {target}. Sidecar upgraded to v1.29/TLS1.2. Compatibility restored.", False)
 
     # ------------------------------------------------------------------
     # Meta actions

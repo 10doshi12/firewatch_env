@@ -691,6 +691,330 @@ def _check_az_a_cpu(services: dict) -> tuple[bool, str]:
     return passed, f"api-gateway-az-a cpu={svc.process_cpu_utilization:.2f} (threshold: 0.80)"
 
 
+# --- Phase 3 Easy Tier Check Functions (SPEC-11) ---
+
+def _check_payment_service_error_rate_lt_05(services: dict) -> tuple[bool, str]:
+    svc = services.get("payment-service")
+    if svc is None:
+        return False, "payment-service not in topology"
+    passed = svc.http_server_error_rate < 0.05
+    return passed, f"payment-service error_rate={svc.http_server_error_rate:.2f} (threshold: 0.05)"
+
+
+def _check_payment_crashloop_zero(services: dict) -> tuple[bool, str]:
+    svc = services.get("payment-service")
+    if svc is None:
+        return False, "payment-service not in topology"
+    val = getattr(svc, "runtime_crashloop_backoff_seconds", None)
+    if val is None:
+        return False, "runtime_crashloop_backoff_seconds not available"
+    passed = val == 0
+    return passed, f"payment-service crashloop_backoff_seconds={val} (threshold: 0)"
+
+
+def _check_order_blocked_threads_zero(services: dict) -> tuple[bool, str]:
+    svc = services.get("order-service")
+    if svc is None:
+        return False, "order-service not in topology"
+    val = getattr(svc, "runtime_blocked_thread_count", None)
+    if val is None:
+        return False, "runtime_blocked_thread_count not available"
+    passed = val == 0
+    return passed, f"order-service blocked_thread_count={val} (threshold: 0)"
+
+
+def _check_notification_log_level_info(services: dict) -> tuple[bool, str]:
+    svc = services.get("notification-service")
+    if svc is None:
+        return False, "notification-service not in topology"
+    level = getattr(svc, "application_log_level", None)
+    passed = level == "INFO"
+    return passed, f"notification-service log_level={level}"
+
+
+def _check_notification_disk_stable(services: dict) -> tuple[bool, str]:
+    svc = services.get("notification-service")
+    if svc is None:
+        return False, "notification-service not in topology"
+    ratio = getattr(svc, "process_disk_usage_ratio", None)
+    if ratio is None:
+        return False, "process_disk_usage_ratio not available"
+    passed = ratio < 0.99
+    return passed, f"notification-service disk_usage_ratio={ratio:.2f}"
+
+
+def _check_payment_dns_failure_zero(services: dict) -> tuple[bool, str]:
+    svc = services.get("payment-service")
+    if svc is None:
+        return False, "payment-service not in topology"
+    rate = getattr(svc, "http_client_dns_resolution_failure_rate", None)
+    if rate is None:
+        return False, "http_client_dns_resolution_failure_rate not available"
+    passed = rate == 0.0
+    return passed, f"payment-service dns_failure_rate={rate}"
+
+
+def _check_recommendation_image_pull_null(services: dict) -> tuple[bool, str]:
+    svc = services.get("recommendation-engine")
+    if svc is None:
+        return False, "recommendation-engine not in topology"
+    err = getattr(svc, "image_pull_error", None)
+    passed = err is None or err == ""
+    return passed, f"recommendation-engine image_pull_error={err}"
+
+
+def _check_auth_clock_offset_lt_1(services: dict) -> tuple[bool, str]:
+    svc = services.get("auth-service")
+    if svc is None:
+        return False, "auth-service not in topology"
+    offset = getattr(svc, "system_clock_offset_seconds", None)
+    if offset is None:
+        return False, "system_clock_offset_seconds not available"
+    passed = abs(offset) < 1.0
+    return passed, f"auth-service clock_offset={offset:.1f}s (threshold: <1.0s)"
+
+
+def _check_auth_ntp_synced(services: dict) -> tuple[bool, str]:
+    svc = services.get("auth-service")
+    if svc is None:
+        return False, "auth-service not in topology"
+    status = getattr(svc, "ntp_sync_status", None)
+    passed = status == "synced"
+    return passed, f"auth-service ntp_sync_status={status}"
+
+
+def _check_payment_cpu_throttle_lt_05(services: dict) -> tuple[bool, str]:
+    svc = services.get("payment-service")
+    if svc is None:
+        return False, "payment-service not in topology"
+    rate = getattr(svc, "process_cpu_throttle_rate", None)
+    if rate is None:
+        return False, "process_cpu_throttle_rate not available"
+    passed = rate < 0.05
+    return passed, f"payment-service cpu_throttle_rate={rate:.2f} (threshold: 0.05)"
+
+
+def _check_payment_p99_lt_050(services: dict) -> tuple[bool, str]:
+    svc = services.get("payment-service")
+    if svc is None:
+        return False, "payment-service not in topology"
+    passed = svc.http_server_request_duration_p99 < 0.50
+    return passed, f"payment-service p99={svc.http_server_request_duration_p99:.2f}s (threshold: 0.50s)"
+
+
+def _check_user_p99_lt_050(services: dict) -> tuple[bool, str]:
+    svc = services.get("user-service")
+    if svc is None:
+        return False, "user-service not in topology"
+    passed = svc.http_server_request_duration_p99 < 0.50
+    return passed, f"user-service p99={svc.http_server_request_duration_p99:.2f}s (threshold: 0.50s)"
+
+
+def _check_user_error_rate_lt_05(services: dict) -> tuple[bool, str]:
+    svc = services.get("user-service")
+    if svc is None:
+        return False, "user-service not in topology"
+    passed = svc.http_server_error_rate < 0.05
+    return passed, f"user-service error_rate={svc.http_server_error_rate:.2f} (threshold: 0.05)"
+
+
+def _check_analytics_memory_lt_80(services: dict) -> tuple[bool, str]:
+    svc = services.get("analytics-service")
+    if svc is None:
+        return False, "analytics-service not in topology"
+    passed = svc.process_memory_utilization < 0.80
+    return passed, f"analytics-service memory={svc.process_memory_utilization:.2f} (threshold: 0.80)"
+
+
+def _check_apigateway_http2_util_lt_70(services: dict) -> tuple[bool, str]:
+    svc = services.get("api-gateway")
+    if svc is None:
+        return False, "api-gateway not in topology"
+    ratio = getattr(svc, "http2_stream_utilization_ratio", None)
+    if ratio is None:
+        return False, "http2_stream_utilization_ratio not available"
+    passed = ratio < 0.70
+    return passed, f"api-gateway http2_stream_utilization={ratio:.2f} (threshold: 0.70)"
+
+
+def _check_apigateway_p99_lt_050(services: dict) -> tuple[bool, str]:
+    svc = services.get("api-gateway")
+    if svc is None:
+        return False, "api-gateway not in topology"
+    passed = svc.http_server_request_duration_p99 < 0.50
+    return passed, f"api-gateway p99={svc.http_server_request_duration_p99:.2f}s (threshold: 0.50s)"
+
+
+def _check_payment_tls_expiry_gt_7m(services: dict) -> tuple[bool, str]:
+    svc = services.get("payment-service")
+    if svc is None:
+        return False, "payment-service not in topology"
+    expiry = getattr(svc, "tls_certificate_expiry_seconds", None)
+    if expiry is None:
+        return False, "tls_certificate_expiry_seconds not available"
+    passed = expiry > 7_000_000
+    return passed, f"payment-service tls_expiry={expiry}s (threshold: >7000000s)"
+
+
+def _check_checkout_rollout_complete(services: dict) -> tuple[bool, str]:
+    svc = services.get("checkout-service")
+    if svc is None:
+        return False, "checkout-service not in topology"
+    progress = getattr(svc, "deployment_rollout_progress_pct", None)
+    if progress is None:
+        return False, "deployment_rollout_progress_pct not available"
+    passed = progress == 0.0 or progress == 100.0
+    return passed, f"checkout-service rollout_progress={progress}%"
+
+
+def _check_auth_node_memory_pressure_false(services: dict) -> tuple[bool, str]:
+    svc = services.get("auth-service")
+    if svc is None:
+        return False, "auth-service not in topology"
+    val = getattr(svc, "node_memory_pressure_active", None)
+    if val is None:
+        return False, "node_memory_pressure_active not available"
+    passed = val is False
+    return passed, f"auth-service node_memory_pressure_active={val}"
+
+
+def _check_auth_restart_stable(services: dict) -> tuple[bool, str]:
+    svc = services.get("auth-service")
+    if svc is None:
+        return False, "auth-service not in topology"
+    passed = svc.restart_count >= 0
+    return passed, f"auth-service restart_count={svc.restart_count}"
+
+
+# --- Phase 3 Medium Tier Check Functions (SPEC-11) ---
+
+def _check_recommendation_ready_replicas_3(services: dict) -> tuple[bool, str]:
+    svc = services.get("recommendation-engine")
+    if svc is None:
+        return False, "recommendation-engine not in topology"
+    val = getattr(svc, "deployment_ready_replicas", None)
+    if val is None:
+        return False, "deployment_ready_replicas not available"
+    passed = val >= 3
+    return passed, f"recommendation-engine ready_replicas={val} (threshold: >=3)"
+
+
+def _check_recommendation_cold_start_false(services: dict) -> tuple[bool, str]:
+    svc = services.get("recommendation-engine")
+    if svc is None:
+        return False, "recommendation-engine not in topology"
+    val = getattr(svc, "deployment_cold_start_in_progress", None)
+    if val is None:
+        return False, "deployment_cold_start_in_progress not available"
+    passed = val is False
+    return passed, f"recommendation-engine cold_start_in_progress={val}"
+
+
+def _check_apigateway_mtls_failure_zero(services: dict) -> tuple[bool, str]:
+    svc = services.get("api-gateway")
+    if svc is None:
+        return False, "api-gateway not in topology"
+    rate = getattr(svc, "mtls_handshake_failure_rate", None)
+    if rate is None:
+        return False, "mtls_handshake_failure_rate not available"
+    passed = rate < 0.01
+    return passed, f"api-gateway mtls_handshake_failure_rate={rate:.3f} (threshold: 0.01)"
+
+
+def _check_payment_mtls_handshake_zero(services: dict) -> tuple[bool, str]:
+    svc = services.get("payment-service")
+    if svc is None:
+        return False, "payment-service not in topology"
+    rate = getattr(svc, "mtls_handshake_failure_rate", None)
+    if rate is None:
+        return False, "mtls_handshake_failure_rate not available"
+    passed = rate < 0.01
+    return passed, f"payment-service mtls_handshake_failure_rate={rate:.3f} (threshold: 0.01)"
+
+
+def _check_payment_cert_rotation_current(services: dict) -> tuple[bool, str]:
+    svc = services.get("payment-service")
+    if svc is None:
+        return False, "payment-service not in topology"
+    status = getattr(svc, "sidecar_cert_rotation_status", None)
+    passed = status == "current"
+    return passed, f"payment-service cert_rotation_status={status}"
+
+
+def _check_db_connection_saturation(services: dict) -> tuple[bool, str]:
+    svc = services.get("db-proxy")
+    if svc is None:
+        return False, "db-proxy not in topology"
+    active = getattr(svc, "db_active_connections", None)
+    max_conn = getattr(svc, "db_max_connections", None)
+    if active is None or max_conn is None:
+        return False, "db_active_connections or db_max_connections not available"
+    passed = active <= max_conn
+    return passed, f"db-proxy active_connections={active} max={max_conn}"
+
+
+def _check_az_b_traffic_weight_zero(services: dict) -> tuple[bool, str]:
+    svc = services.get("api-gateway-az-b")
+    if svc is None:
+        return False, "api-gateway-az-b not in topology"
+    weight = getattr(svc, "lb_az_traffic_weight", None)
+    if weight is None:
+        return False, "lb_az_traffic_weight not available"
+    passed = weight == 0.0
+    return passed, f"api-gateway-az-b lb_az_traffic_weight={weight}"
+
+
+def _check_az_b_error_rate(services: dict) -> tuple[bool, str]:
+    svc = services.get("api-gateway-az-b")
+    if svc is None:
+        return False, "api-gateway-az-b not in topology"
+    passed = svc.http_server_error_rate < 0.10
+    return passed, f"api-gateway-az-b error_rate={svc.http_server_error_rate:.2f} (threshold: 0.10)"
+
+
+# --- Phase 3 Hard Tier Check Functions (SPEC-12) ---
+
+def _check_pipeline_freshness_lag(services: dict) -> tuple[bool, str]:
+    svc = services.get("feature-pipeline")
+    if svc is None:
+        return False, "feature-pipeline not in topology"
+    lag = getattr(svc, "data_freshness_lag_seconds", None)
+    if lag is None:
+        return False, "data_freshness_lag_seconds not available"
+    passed = lag < 300.0
+    return passed, f"feature-pipeline data_freshness_lag={lag:.1f}s (threshold: 300s)"
+
+
+def _check_pipeline_memory_lt_50(services: dict) -> tuple[bool, str]:
+    svc = services.get("feature-pipeline")
+    if svc is None:
+        return False, "feature-pipeline not in topology"
+    passed = svc.process_memory_utilization < 0.50
+    return passed, f"feature-pipeline memory={svc.process_memory_utilization:.2f} (threshold: 0.50)"
+
+
+def _check_pipeline_throughput_ratio(services: dict) -> tuple[bool, str]:
+    svc = services.get("feature-pipeline")
+    if svc is None:
+        return False, "feature-pipeline not in topology"
+    ratio = getattr(svc, "pipeline_throughput_ratio", None)
+    if ratio is None:
+        return False, "pipeline_throughput_ratio not available"
+    passed = ratio > 1.0
+    return passed, f"feature-pipeline throughput_ratio={ratio:.3f} (threshold: >1.0)"
+
+
+def _check_payment_mtls_compat(services: dict) -> tuple[bool, str]:
+    svc = services.get("payment-service")
+    if svc is None:
+        return False, "payment-service not in topology"
+    compat = getattr(svc, "mtls_cipher_compatibility", None)
+    if compat is None:
+        return False, "mtls_cipher_compatibility not available"
+    passed = compat is True
+    return passed, f"payment-service mtls_cipher_compatibility={compat}"
+
+
 TASK_SPECIFIC_CONDITIONS: dict[str, list[tuple]] = {
     # Easy Tier
     "task_easy_thundering_herd": [
@@ -793,6 +1117,99 @@ TASK_SPECIFIC_CONDITIONS: dict[str, list[tuple]] = {
     "task_hard_multiz_failover": [
         (_check_az_a_error_rate, "api-gateway-az-a error rate < 0.10"),
         (_check_az_a_cpu, "api-gateway-az-a cpu < 0.80"),
+    ],
+    # Phase 3 Easy Tier (SPEC-11)
+    "task_easy_crashloop_backoff": [
+        (_check_payment_crashloop_zero, "payment-service crashloop_backoff_seconds = 0"),
+        (_check_payment_service_error_rate_lt_05, "payment-service error rate < 0.05"),
+    ],
+    "task_easy_thread_deadlock": [
+        (_check_order_blocked_threads_zero, "order-service blocked_thread_count = 0"),
+        (_check_order_error_rate, "order-service error rate < 0.05"),
+    ],
+    "task_easy_log_storm_disk": [
+        (_check_notification_log_level_info, "notification-service log_level = INFO"),
+        (_check_notification_disk_stable, "notification-service disk stable"),
+        (_check_notification_error_rate, "notification-service error rate < 0.05"),
+    ],
+    "task_easy_dns_nxdomain": [
+        (_check_payment_dns_failure_zero, "payment-service dns_failure_rate = 0"),
+        (_check_payment_service_error_rate_lt_05, "payment-service error rate < 0.05"),
+    ],
+    "task_easy_image_pull_backoff": [
+        (_check_recommendation_image_pull_null, "recommendation-engine image_pull_error = null"),
+        (_check_recommendation_error_rate, "recommendation-engine error rate < 0.05"),
+    ],
+    "task_easy_jwt_clock_skew": [
+        (_check_auth_clock_offset_lt_1, "auth-service clock_offset < 1.0s"),
+        (_check_auth_ntp_synced, "auth-service ntp_sync_status = synced"),
+        (_check_auth_error_rate, "auth-service error rate < 0.05"),
+    ],
+    "task_easy_cpu_throttling": [
+        (_check_payment_cpu_throttle_lt_05, "payment-service cpu_throttle_rate < 0.05"),
+        (_check_payment_p99_lt_050, "payment-service p99 < 0.50s"),
+    ],
+    "task_easy_slow_db_query": [
+        (_check_user_p99_lt_050, "user-service p99 < 0.50s"),
+        (_check_user_error_rate_lt_05, "user-service error rate < 0.05"),
+    ],
+    "task_easy_rbac_403": [
+        (_check_notification_error_rate, "notification-service error rate < 0.05"),
+    ],
+    "task_easy_cronjob_spike": [
+        (_check_analytics_memory_lt_80, "analytics-service memory < 0.80"),
+    ],
+    "task_easy_http2_streams": [
+        (_check_apigateway_http2_util_lt_70, "api-gateway http2_utilization < 0.70"),
+        (_check_apigateway_p99_lt_050, "api-gateway p99 < 0.50s"),
+        (_check_apigateway_error_rate_lt_05, "api-gateway error rate < 0.05"),
+    ],
+    "task_easy_cert_expiry": [
+        (_check_payment_tls_expiry_gt_7m, "payment-service tls_expiry > 7000000s"),
+        (_check_payment_service_error_rate_lt_05, "payment-service error rate < 0.05"),
+    ],
+    "task_easy_rollout_stuck": [
+        (_check_checkout_rollout_complete, "checkout-service rollout complete"),
+        (_check_checkout_error_rate_lt_05, "checkout-service error rate < 0.05"),
+    ],
+    "task_easy_noisy_neighbor": [
+        (_check_auth_node_memory_pressure_false, "auth-service node_memory_pressure = False"),
+        (_check_auth_restart_stable, "auth-service restart_count stable"),
+        (_check_auth_error_rate, "auth-service error rate < 0.05"),
+    ],
+    # Phase 3 Medium Tier (SPEC-11)
+    "task_medium_hpa_cold_start": [
+        (_check_recommendation_ready_replicas_3, "recommendation-engine ready_replicas >= 3"),
+        (_check_recommendation_cold_start_false, "recommendation-engine cold_start = False"),
+        (_check_recommendation_error_rate, "recommendation-engine error rate < 0.05"),
+    ],
+    "task_medium_config_race": [
+        (_check_apigateway_mtls_failure_zero, "api-gateway mtls_failure_rate < 0.01"),
+        (_check_apigateway_error_rate_lt_05, "api-gateway error rate < 0.05"),
+    ],
+    "task_medium_mtls_rotation": [
+        (_check_payment_mtls_handshake_zero, "payment-service mtls_failure_rate < 0.01"),
+        (_check_payment_cert_rotation_current, "payment-service cert_rotation = current"),
+        (_check_payment_service_error_rate_lt_05, "payment-service error rate < 0.05"),
+    ],
+    "task_medium_db_connection_herd": [
+        (_check_db_connection_saturation, "db-proxy connections <= max"),
+        (_check_db_proxy_error_rate, "db-proxy error rate < 0.10"),
+    ],
+    "task_medium_single_az_partition": [
+        (_check_az_b_traffic_weight_zero, "api-gateway-az-b traffic_weight = 0.0"),
+        (_check_az_b_error_rate, "api-gateway-az-b error rate < 0.10"),
+    ],
+    # Phase 3 Hard Tier (SPEC-12)
+    "task_hard_pipeline_freshness": [
+        (_check_pipeline_freshness_lag, "feature-pipeline freshness_lag < 300"),
+        (_check_pipeline_memory_lt_50, "feature-pipeline memory < 0.50"),
+        (_check_pipeline_throughput_ratio, "feature-pipeline throughput_ratio > 1.0"),
+    ],
+    "task_hard_mesh_proxy_upgrade": [
+        (_check_payment_mtls_compat, "payment-service mtls_cipher_compatibility = True"),
+        (_check_payment_error_rate_hard, "payment-service error_rate < 0.10"),
+        (_check_checkout_error_rate_lt_05, "checkout-service error_rate < 0.05"),
     ],
 }
 

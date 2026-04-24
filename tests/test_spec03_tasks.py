@@ -80,8 +80,8 @@ class TestTaskRegistry:
             assert tid in TASKS, f"Legacy task missing: {tid}"
 
     def test_total_task_count(self):
-        """3 legacy + 15 Phase 1 + 16 Phase 2 + 8 SPEC-08 Hard = 42 total tasks."""
-        assert len(TASKS) == 42, f"Expected 42 tasks, got {len(TASKS)}"
+        """3 legacy + 15 Phase 1 + 16 Phase 2 + 8 SPEC-08 Hard + 19 SPEC-11 P3 + 2 SPEC-12 P3 Hard = 63 total tasks."""
+        assert len(TASKS) == 63, f"Expected 63 tasks, got {len(TASKS)}"
 
     @pytest.mark.parametrize("task_id", PHASE1_TASK_IDS)
     def test_budget_identity(self, task_id):
@@ -551,11 +551,68 @@ class TestHardTier:
             "task_hard_config_drift_noise", "task_hard_adversarial_triple",
             "task_hard_partial_infra_asymmetric", "task_hard_multiteam_dual_fault",
             "task_hard_cache_corruption",
+            # SPEC-12 Phase 3 Hard
+            "task_hard_pipeline_freshness", "task_hard_mesh_proxy_upgrade",
         ]
         for tid in hard_ids:
             task = TASKS[tid]
             assert task.max_ticks == 40, f"{tid}: expected 40 ticks"
             assert task.slo_burn_rate == 3.0, f"{tid}: expected 3.0 burn rate"
+
+    # --- SPEC-12 Phase 3 Hard Tier ---
+
+    def test_h_r5_pipeline_freshness(self):
+        """H-R5: Data Pipeline Freshness SLO Violation."""
+        mesh, fc = generate_episode("hard", 8192, task_id="task_hard_pipeline_freshness")
+        assert fc.root_cause_service == "feature-pipeline"
+        assert fc.fault_type == "memory_leak"
+        assert "feature-pipeline" in mesh.services
+        assert "feature-store" in mesh.services
+        assert "event-ingestion" in mesh.services
+        # All services have error_rate=0.0
+        for svc_name, svc in mesh.services.items():
+            assert svc.http_server_error_rate == 0.0, (
+                f"{svc_name} error_rate={svc.http_server_error_rate}, expected 0.0"
+            )
+        # Pipeline metrics present
+        fp = mesh.services["feature-pipeline"]
+        assert hasattr(fp, "data_freshness_lag_seconds")
+        assert fp.data_freshness_lag_seconds == 1847.0
+        assert hasattr(fp, "pipeline_queue_depth")
+        assert fp.pipeline_queue_depth == 12400
+        assert hasattr(fp, "pipeline_throughput_ratio")
+        assert fp.pipeline_throughput_ratio == 0.472
+        # BCM mode
+        task = TASKS["task_hard_pipeline_freshness"]
+        assert task.bcm_mode == "freshness"
+        # Adversarial log
+        assert len(mesh._adversarial_logs) == 1
+        assert mesh._adversarial_logs[0]["service"] == "analytics-service"
+
+    def test_h_r12_mesh_proxy_upgrade(self):
+        """H-R12: Service Mesh Proxy Rolling Upgrade Partial Failure."""
+        mesh, fc = generate_episode("hard", 12288, task_id="task_hard_mesh_proxy_upgrade")
+        assert fc.root_cause_service == "payment-service"
+        assert fc.fault_type == "config_drift"
+        assert len(mesh.services) == 10
+        # Root cause: payment on v1.28
+        pay = mesh.services["payment-service"]
+        assert hasattr(pay, "sidecar_proxy_version")
+        assert pay.sidecar_proxy_version == "v1.28"
+        assert hasattr(pay, "mtls_cipher_compatibility")
+        assert pay.mtls_cipher_compatibility is False
+        # Red herrings also on v1.28
+        auth = mesh.services["auth-service"]
+        assert auth.sidecar_proxy_version == "v1.28"
+        user = mesh.services["user-service"]
+        assert user.sidecar_proxy_version == "v1.28"
+        # Already upgraded services on v1.29
+        gw = mesh.services["api-gateway"]
+        assert gw.sidecar_proxy_version == "v1.29"
+        assert gw.mtls_cipher_compatibility is True
+        # Adversarial log
+        assert len(mesh._adversarial_logs) == 1
+        assert mesh._adversarial_logs[0]["service"] == "analytics-service"
 
 
 # ==========================================================================

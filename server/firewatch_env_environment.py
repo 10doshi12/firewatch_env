@@ -235,7 +235,7 @@ class FirewatchEnvironment(Environment):
     Wires all components behind the OpenEnv step/reset/state API:
     - ServiceMesh (simulation.py) — physics engine
     - FaultInjector (simulation.py) — procedural episode generation
-    - ActionHandler (actions.py) — 10 action types → state mutations
+    - ActionHandler (actions.py) — 72 action types → state mutations
     - RewardEngine (rewards.py) — outcome-based per-step rewards
     - Grader (rewards.py) — unified 4-component episode scoring
 

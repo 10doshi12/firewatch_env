@@ -46,6 +46,7 @@ try:
         BCM_LATENCY_SCALE,
         BCM_LATENCY_WEIGHT,
         BCM_LATENCY_NORMALIZED_MAX,
+        BCM_FRESHNESS_CEILING,
         TASKS,
         TaskConfig,
         # SPEC-06 §H-R2: Metastable loop constants
@@ -85,6 +86,7 @@ except ImportError:
         BCM_LATENCY_SCALE,
         BCM_LATENCY_WEIGHT,
         BCM_LATENCY_NORMALIZED_MAX,
+        BCM_FRESHNESS_CEILING,
         TASKS,
         TaskConfig,
         # SPEC-06 §H-R2: Metastable loop constants
@@ -323,6 +325,9 @@ class ServiceMesh:
         # SPEC-01 §5: Adversarial log injection entries
         self._adversarial_logs: list[dict] = []
 
+        # SPEC-12: Task config reference for BCM mode detection
+        self._task_config: TaskConfig | None = None
+
         # Build reverse dependency map: service → list of services that depend on it
         self._reverse_deps: dict[str, list[str]] = {svc: [] for svc in services}
         for svc, deps in dependency_graph.items():
@@ -388,6 +393,28 @@ class ServiceMesh:
             if getattr(metrics, "image_pull_error", "") == "ImagePullBackOff":
                 metrics.restart_count = 0
 
+        # --- Pipeline Queue Dynamics (H-R5 SPEC-12) ---
+        # If a service has pipeline processing/ingestion rates, update queue
+        for metrics in self.services.values():
+            processing_rate = getattr(metrics, "pipeline_processing_rate_events_per_second", None)
+            ingestion_rate = getattr(metrics, "pipeline_ingestion_rate_events_per_second", None)
+            if processing_rate is not None and ingestion_rate is not None:
+                queue_depth = getattr(metrics, "pipeline_queue_depth", 0)
+                # Queue grows when ingestion > processing, drains when processing > ingestion
+                delta_events = (ingestion_rate - processing_rate) * SECONDS_PER_TICK
+                new_queue = max(0, int(queue_depth + delta_events))
+                metrics.pipeline_queue_depth = new_queue
+                # Update throughput ratio
+                if ingestion_rate > 0:
+                    metrics.pipeline_throughput_ratio = round(processing_rate / ingestion_rate, 3)
+                # Update freshness lag: proportional to queue depth
+                if new_queue > 0 and processing_rate > 0:
+                    metrics.data_freshness_lag_seconds = round(new_queue / processing_rate, 1)
+                    metrics.feature_vector_age_seconds_p99 = metrics.data_freshness_lag_seconds
+                else:
+                    metrics.data_freshness_lag_seconds = 0.0
+                    metrics.feature_vector_age_seconds_p99 = 0.0
+
         # 4. Update status on all services
         for svc_name, metrics in self.services.items():
             metrics.status = derive_status(
@@ -406,7 +433,21 @@ class ServiceMesh:
 
         # 6. Calculate BCM and update SLO
         bcm_delta = self._calculate_bcm_delta()
-        self.incident_metrics.update(bcm_delta, self.tick_count)
+
+        # SPEC-12 H-R5: MTTM override for freshness mode
+        # In freshness mode, MTTM triggers when data_freshness_lag < 300s
+        if self._task_config and self._task_config.bcm_mode == "freshness":
+            freshness_svc = self.services.get(self._task_config.fault_service)
+            if freshness_svc:
+                lag = getattr(freshness_svc, "data_freshness_lag_seconds", 9999.0)
+                if lag < 300.0 and not self.incident_metrics._mttm_locked:
+                    self.incident_metrics.mttm_achieved_tick = self.tick_count
+                    self.incident_metrics._mttm_locked = True
+                self.incident_metrics.bad_customer_minutes += bcm_delta
+            else:
+                self.incident_metrics.update(bcm_delta, self.tick_count)
+        else:
+            self.incident_metrics.update(bcm_delta, self.tick_count)
 
         # Deplete SLO budget based on overall system health
         degraded_count = sum(
@@ -773,6 +814,15 @@ class ServiceMesh:
         where latency_normalized = max(0, (latency_p99 - 0.5) / 2.0)
         """
         bcm_delta = 0.0
+
+        # SPEC-12 H-R5: Freshness-based BCM override
+        if self._task_config and self._task_config.bcm_mode == "freshness":
+            for metrics in self.services.values():
+                freshness_lag = getattr(metrics, "data_freshness_lag_seconds", 0.0)
+                if freshness_lag > 0.0:
+                    bcm_delta += (freshness_lag / BCM_FRESHNESS_CEILING) * (SECONDS_PER_TICK / 60.0)
+            return bcm_delta
+
         for metrics in self.services.values():
             if metrics.status == "healthy":
                 continue
@@ -1059,6 +1109,9 @@ def generate_episode(
         active_faults.append(secondary_fault)
 
     mesh.active_faults = active_faults
+
+    # SPEC-12: Store task config reference for BCM mode detection
+    mesh._task_config = task
 
     # --- SPEC-03: Apply initial_state_overrides ---
     # These override per-service fields BEFORE any fault physics run.
