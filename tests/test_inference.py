@@ -25,6 +25,8 @@ from inference import (
     SYSTEM_PROMPT,
     SUCCESS_SCORE_THRESHOLD,
 )
+import inference
+from config import TASKS
 from models import FirewatchAction
 from server.firewatch_env_environment import FirewatchEnvironment
 
@@ -125,6 +127,30 @@ def test_parse_with_extra_text():
     print("✓ test_parse_with_extra_text PASSED")
 
 
+def test_parse_normalizes_action_targets_schema():
+    """Normalize common LLM alternate schema into FirewatchAction fields."""
+    resp = '{"action": "fetch_logs", "targets": ["auth-service"]}'
+    action = parse_llm_response(resp, ["api-gateway", "auth-service"])
+
+    assert action == {
+        "action_type": "fetch_logs",
+        "target_service": "auth-service",
+        "parameters": {},
+    }
+
+
+def test_parse_rejects_unknown_target_in_action_targets_schema():
+    """Alternate schema must not smuggle a target outside current services."""
+    resp = '{"action": "fetch_logs", "targets": ["unknown-service"]}'
+    action = parse_llm_response(resp, ["api-gateway", "auth-service"])
+
+    assert action == {
+        "action_type": "fetch_logs",
+        "target_service": "api-gateway",
+        "parameters": {},
+    }
+
+
 def test_summarize_under_400_tokens():
     """Observation summary stays under 400 tokens (~1600 chars)."""
     env = FirewatchEnvironment()
@@ -167,26 +193,26 @@ def test_stdout_format_compliance():
         obs = env.step(action)
         reward = obs.reward or 0.0
         rewards.append(reward)
-        line = f"[STEP] step={i} action={fmt_action(action)} reward={fmt_reward(reward)} done={fmt_done(obs.done)} error=null"
+        line = f"[STEP] step={i} action={fmt_action(action)} done={fmt_done(obs.done)} error=null"
         step_lines.append(line)
 
     # Verify START line format
-    start_line = "[START] task=task_easy env=firewatch-env model=test-model"
+    start_line = "[START] task=task_easy_oom_baseline env=firewatch-env model=test-model"
     assert re.match(r"^\[START\] task=\S+ env=\S+ model=\S+$", start_line), f"Bad START: {start_line}"
 
     # Verify STEP line format
     for line in step_lines:
         assert re.match(
-            r"^\[STEP\] step=\d+ action=\S+ reward=-?\d+\.\d{2} done=(true|false) error=\S+$",
+            r"^\[STEP\] step=\d+ action=\S+ done=(true|false) error=\S+$",
             line
         ), f"Bad STEP: {line}"
 
     # Verify END line format
     score = obs.metadata.get("episode_score", 0.0)
     success = score >= SUCCESS_SCORE_THRESHOLD
-    end_line = f"[END] success={fmt_success(success)} steps={len(actions_taken)} score={fmt_score(score)} rewards={fmt_rewards_list(rewards)}"
+    end_line = f"[END] success={fmt_success(success)} steps={len(actions_taken)}"
     assert re.match(
-        r"^\[END\] success=(true|false) steps=\d+ score=\d+\.\d{2} rewards=(-?\d+\.\d{2},?)+$",
+        r"^\[END\] success=(true|false) steps=\d+$",
         end_line
     ), f"Bad END: {end_line}"
 
@@ -203,6 +229,298 @@ def test_system_prompt_completeness():
     for at in action_types:
         assert at in SYSTEM_PROMPT, f"Missing action {at} in system prompt"
     print("✓ test_system_prompt_completeness PASSED")
+
+
+def test_get_task_specs_covers_registered_tasks():
+    """Inference should enumerate the full registered task surface."""
+    assert hasattr(inference, "get_task_specs")
+
+    specs = inference.get_task_specs()
+    by_id = {spec.task_id: spec for spec in specs}
+
+    assert set(by_id) == set(TASKS)
+    for task_id, task in TASKS.items():
+        assert by_id[task_id].difficulty == task.difficulty
+        assert by_id[task_id].seed == task.grader_seed
+        assert by_id[task_id].max_ticks == task.max_ticks
+
+
+def test_select_task_specs_defaults_to_all_registered_tasks():
+    """Normal inference runs the full benchmark surface."""
+    specs = inference.select_task_specs(test_run=False)
+
+    assert [spec.task_id for spec in specs] == [
+        spec.task_id for spec in inference.get_task_specs()
+    ]
+
+
+def test_select_task_specs_test_run_limits_to_three_tasks():
+    """--test-run should execute only three representative tasks."""
+    specs = inference.select_task_specs(test_run=True)
+
+    assert len(specs) == 3
+    assert [spec.difficulty for spec in specs] == ["easy", "medium", "hard"]
+
+
+def test_env_reset_sends_task_id(monkeypatch):
+    """Explicit task_id keeps server task selection unambiguous."""
+    captured = {}
+
+    def fake_post(url, body):
+        captured["url"] = url
+        captured["body"] = body
+        return {"observation": {}}
+
+    monkeypatch.setattr(inference, "http_post", fake_post)
+
+    inference.env_reset("easy", 315, task_id="task_easy_quota_runaway")
+
+    assert captured["body"] == {
+        "difficulty": "easy",
+        "seed": 315,
+        "task_id": "task_easy_quota_runaway",
+    }
+
+
+def test_run_task_honors_max_ticks(monkeypatch):
+    """run_task should use the task max_ticks parameter, not the global cap."""
+    calls = {"steps": 0}
+    obs = {
+        "services": {
+            "notification-service": {
+                "http_server_error_rate": 0.20,
+                "http_server_request_duration_p99": 0.2,
+                "process_memory_utilization": 0.3,
+                "status": "degraded",
+            }
+        },
+        "dependency_graph": {"notification-service": []},
+        "active_alerts": [],
+        "sim_tick": 1,
+        "slo_budget_remaining_pct": 30.0,
+        "bad_customer_minutes": 0.0,
+    }
+
+    def fake_reset(difficulty, seed, task_id=None):
+        return {"observation": obs, "done": False}
+
+    def fake_step(action):
+        calls["steps"] += 1
+        return {
+            "observation": {**obs, "episode_score": 0.25 if action["action_type"] == "declare_resolved" else None},
+            "reward": 0.0,
+            "done": action["action_type"] == "declare_resolved",
+            "info": {"action_feedback": "ok"},
+        }
+
+    monkeypatch.setattr(inference, "env_reset", fake_reset)
+    monkeypatch.setattr(inference, "env_step", fake_step)
+    monkeypatch.setattr(
+        inference,
+        "get_action",
+        lambda client, obs, step, history, state, seed: (
+            {"action_type": "fetch_logs", "target_service": "notification-service"},
+            "rule",
+            None,
+        ),
+    )
+
+    score, steps, rewards = inference.run_task(
+        None, "task_easy_quota_runaway", "easy", 315, max_ticks=2
+    )
+
+    assert steps == 3  # two allowed steps, then forced declare_resolved
+    assert calls["steps"] == 3
+    assert score == 0.25
+    assert len(rewards) == 3
+
+
+def test_agent_context_excludes_reward_signals(monkeypatch):
+    obs = {
+        "services": {
+            "notification-service": {
+                "http_server_error_rate": 0.20,
+                "http_server_request_duration_p99": 0.2,
+                "process_memory_utilization": 0.3,
+                "status": "degraded",
+            }
+        },
+        "dependency_graph": {"notification-service": []},
+        "active_alerts": [],
+        "sim_tick": 1,
+        "slo_budget_remaining_pct": 30.0,
+        "bad_customer_minutes": 0.0,
+    }
+
+    user_prompt = inference.build_user_prompt(
+        obs,
+        step=1,
+        history=["Step 1 [rule]: fetch_logs:notification-service | Fetched logs"],
+        state={"fetched_logs": {}},
+    )
+
+    assert "reward" not in user_prompt.lower()
+    assert "score" not in user_prompt.lower()
+    assert "reward" not in inference.SYSTEM_PROMPT.lower()
+    assert "score" not in inference.SYSTEM_PROMPT.lower()
+
+    captured_history = []
+
+    def fake_get_action(client, obs, step, history, state, seed):
+        captured_history.extend(history)
+        return (
+            {"action_type": "fetch_logs", "target_service": "notification-service"},
+            "rule",
+            None,
+        )
+
+    def fake_reset(difficulty, seed, task_id=None):
+        return {"observation": obs, "done": False}
+
+    def fake_step(action):
+        return {
+            "observation": {**obs, "episode_score": 0.25 if action["action_type"] == "declare_resolved" else None},
+            "reward": 9.99,
+            "done": action["action_type"] == "declare_resolved",
+            "info": {"action_feedback": "ok"},
+        }
+
+    monkeypatch.setattr(inference, "get_action", fake_get_action)
+    monkeypatch.setattr(inference, "env_reset", fake_reset)
+    monkeypatch.setattr(inference, "env_step", fake_step)
+
+    inference.run_task(None, "task_easy_quota_runaway", "easy", 315, max_ticks=2)
+
+    assert all("reward" not in item.lower() for item in captured_history)
+    assert all("score" not in item.lower() for item in captured_history)
+
+
+def test_task_hint_removed_from_baseline_agent():
+    """Inference must not mine task descriptions for answer-key remediation hints."""
+    assert not hasattr(inference, "_task_hint")
+
+
+def test_rule_based_action_ignores_task_description_correct_path(monkeypatch):
+    """Fallback remediation should come from telemetry/logs, not TASKS descriptions."""
+    class LeakyTask:
+        description = "Correct path: rollback_deploy(auth-service) → declare_resolved."
+
+    obs = {
+        "services": {
+            "auth-service": {
+                "http_server_error_rate": 0.31,
+                "http_server_request_duration_p99": 0.2,
+                "process_memory_utilization": 0.99,
+                "status": "critical",
+            }
+        },
+        "dependency_graph": {"auth-service": []},
+    }
+    state = {
+        "task_id": "leaky_task",
+        "fetched_logs": {"auth-service": ["OOMKilled exit code 137 memory limit exceeded"]},
+    }
+
+    monkeypatch.setitem(inference.TASKS, "leaky_task", LeakyTask())
+
+    action = inference.rule_based_action(obs, step=4, state=state)
+
+    assert action == {"action_type": "restart_service", "target_service": "auth-service"}
+
+
+def test_graph_ranker_prefers_upstream_degraded_root_cause():
+    obs = {
+        "services": {
+            "api-gateway": {
+                "http_server_error_rate": 0.60,
+                "http_server_request_duration_p99": 1.0,
+                "process_memory_utilization": 0.40,
+                "http_server_active_requests": 500,
+                "status": "critical",
+            },
+            "auth-service": {
+                "http_server_error_rate": 0.22,
+                "http_server_request_duration_p99": 0.8,
+                "process_memory_utilization": 0.75,
+                "http_server_active_requests": 120,
+                "status": "degraded",
+            },
+            "user-service": {
+                "http_server_error_rate": 0.30,
+                "http_server_request_duration_p99": 0.6,
+                "process_memory_utilization": 0.45,
+                "http_server_active_requests": 150,
+                "status": "degraded",
+            },
+        },
+        "dependency_graph": {
+            "api-gateway": ["auth-service", "user-service"],
+            "user-service": ["auth-service"],
+            "auth-service": [],
+        },
+    }
+
+    candidates = inference.graph_rank_root_causes(obs)
+
+    assert candidates[0]["service"] == "auth-service"
+    assert candidates[0]["downstream_blast_radius"] == 2
+
+
+def test_action_menu_excludes_irrelevant_global_actions():
+    obs = {
+        "services": {
+            "auth-service": {
+                "http_server_error_rate": 0.24,
+                "http_server_request_duration_p99": 0.4,
+                "process_memory_utilization": 0.96,
+                "status": "critical",
+            }
+        },
+        "dependency_graph": {"auth-service": []},
+    }
+
+    menu = inference.available_actions_for_episode(obs, state={"fetched_logs": {}})
+    action_types = {item["action_type"] for item in menu}
+
+    assert {"fetch_logs", "get_metrics_detail", "trace_dependencies", "declare_resolved"} <= action_types
+    assert "restart_service" in action_types
+    assert "rollback_proxy_upgrade" not in action_types
+    assert "restart_pipeline_job" not in action_types
+
+
+def test_prompt_excludes_task_descriptions_and_includes_graph_menu():
+    obs = {
+        "services": {
+            "auth-service": {
+                "http_server_error_rate": 0.24,
+                "http_server_request_duration_p99": 0.4,
+                "process_memory_utilization": 0.96,
+                "status": "critical",
+            }
+        },
+        "dependency_graph": {"auth-service": []},
+        "active_alerts": [],
+        "sim_tick": 2,
+        "slo_budget_remaining_pct": 80.0,
+        "bad_customer_minutes": 4.0,
+    }
+
+    prompt = inference.build_user_prompt(
+        obs,
+        step=2,
+        history=[],
+        state={
+            "task_id": "task_with_correct_path",
+            "task_description": "Correct path: rollback_deploy(auth-service)",
+            "fetched_logs": {"auth-service": ["OOMKilled exit code 137"]},
+        },
+    )
+
+    lower = prompt.lower()
+    assert "correct path" not in lower
+    assert "task_with_correct_path" not in prompt
+    assert "ranked root-cause candidates" in lower
+    assert "available action menu" in lower
 
 
 # ---------------------------------------------------------------------------

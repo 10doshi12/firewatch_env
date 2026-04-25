@@ -984,7 +984,7 @@ def generate_episode(
     rng = random.Random(seed)
 
     # --- Task config lookup ---
-    # Priority: explicit task_id > seed-based lookup > legacy difficulty key
+    # Priority: explicit task_id > seed-based lookup > generic random episode
     task: TaskConfig | None = None
     if task_id:
         task = TASKS.get(task_id)
@@ -993,17 +993,12 @@ def generate_episode(
     else:
         # Try seed-based lookup: match (difficulty, seed) to a registered task
         task = _lookup_task_by_seed(difficulty, seed)
-        if task is None:
-            # Legacy fallback: use the difficulty-keyed task
-            task_key = f"task_{difficulty}"
-            task = TASKS.get(task_key)
-
-    if task is None:
-        raise ValueError(f"No task config found for difficulty={difficulty}, seed={seed}")
 
     # --- Determine episode parameters ---
     # Explicit task config mode: use services/fault_service directly
-    has_explicit_config = bool(task.services) and bool(task.fault_service)
+    has_explicit_config = (
+        task is not None and bool(task.services) and bool(task.fault_service)
+    )
 
     if has_explicit_config:
         active_services = list(task.services)
@@ -1017,9 +1012,13 @@ def generate_episode(
         if task.adversarial_logs:
             prompt_injection_svc = task.adversarial_logs[0].get("service")
     else:
-        # Legacy random sampling mode
-        num_services = task.num_services
-        num_red_herrings = task.num_red_herrings
+        # Generic random sampling mode for ad-hoc local tests/dev episodes.
+        num_services_by_difficulty = {"easy": 3, "medium": 5, "hard": 7}
+        num_red_herrings_by_difficulty = {"easy": 0, "medium": 1, "hard": 3}
+        if difficulty not in num_services_by_difficulty:
+            raise ValueError(f"Unknown difficulty: {difficulty}")
+        num_services = num_services_by_difficulty[difficulty]
+        num_red_herrings = num_red_herrings_by_difficulty[difficulty]
         deg_speed = DEGRADATION_SPEED_BY_DIFFICULTY[difficulty]
 
         active_services = rng.sample(ALL_SERVICES, num_services)
@@ -1159,11 +1158,13 @@ def generate_episode(
 def _lookup_task_by_seed(difficulty: str, seed: int) -> "TaskConfig | None":
     """Reverse-lookup a TaskConfig by (difficulty, seed) pair.
 
-    Scans TASKS for a config matching both difficulty and seed.
+    Scans TASKS for a config matching difficulty and either seed field.
     Returns None if no explicit match found (legacy fallback).
     """
     for task in TASKS.values():
-        if task.difficulty == difficulty and task.seed == seed:
+        if task.difficulty == difficulty and (
+            task.seed == seed or task.grader_seed == seed
+        ):
             return task
     return None
 

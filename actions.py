@@ -1045,12 +1045,14 @@ class ActionHandler:
             )
             if fc.fault_type == "oom":
                 self._halt_fault_on(mesh, target, "oom")
+            elif fc.fault_type == "memory_leak":
+                self._halt_fault_on(mesh, target, "memory_leak")
             return (
                 f"Scaled {target}: memory limit increased to {new_limit_mb}Mi. "
                 f"Memory utilization dropped to "
                 f"{svc.process_memory_utilization:.1%} with new headroom."
                 + (" OOM risk eliminated." if fc.fault_type == "oom" else
-                   " Memory leak continues but with more runway."),
+                   " Memory leak pressure relieved; recovery can proceed."),
                 False,
             )
 

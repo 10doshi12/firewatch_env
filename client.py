@@ -65,6 +65,8 @@ class FirewatchEnv(
             StepResult with SystemObservation
         """
         obs_data = payload.get("observation", {})
+        if "metadata" not in obs_data and "info" in payload:
+            obs_data = {**obs_data, "metadata": payload["info"]}
         observation = SystemObservation(**obs_data)
 
         return StepResult(

@@ -262,6 +262,7 @@ class FirewatchEnvironment(Environment):
         self._episode_done: bool = False
         self._task_id: str | None = None
         self._max_ticks: int = 20
+        self._last_info: dict = {}
 
     # ------------------------------------------------------------------
     # reset() — initialise a new episode
@@ -295,7 +296,6 @@ class FirewatchEnvironment(Environment):
             self._state = State(episode_id=str(uuid4()), step_count=0)
             self._difficulty = difficulty
             self._episode_seed = seed
-            self._task_id = task_id
 
             # --- SPEC-04 §4: Fail-fast service validation ---
             # Verify all service references exist in ALL_SERVICES before generating.
@@ -304,9 +304,12 @@ class FirewatchEnvironment(Environment):
                 _task_cfg = TASKS.get(task_id)
             if _task_cfg is None:
                 for _t in TASKS.values():
-                    if _t.difficulty == difficulty and _t.seed == seed:
+                    if _t.difficulty == difficulty and (
+                        _t.seed == seed or _t.grader_seed == seed
+                    ):
                         _task_cfg = _t
                         break
+            self._task_id = _task_cfg.task_id if _task_cfg is not None else task_id
             if _task_cfg is not None:
                 _all_svc_set = set(ALL_SERVICES)
                 _refs: set[str] = set()
@@ -371,6 +374,7 @@ class FirewatchEnvironment(Environment):
             self._episode_result.initial_slo_budget = SLO_BUDGET_BY_DIFFICULTY[difficulty]
             self._action_history = []
             self._episode_done = False
+            self._last_info = {}
 
             # Look up max ticks — try task_id first, then seed-based, then legacy
             task_config = None
@@ -379,11 +383,11 @@ class FirewatchEnvironment(Environment):
             if task_config is None:
                 # Seed-based or legacy lookup
                 for t in TASKS.values():
-                    if t.difficulty == difficulty and t.seed == seed:
+                    if t.difficulty == difficulty and (
+                        t.seed == seed or t.grader_seed == seed
+                    ):
                         task_config = t
                         break
-            if task_config is None:
-                task_config = TASKS.get(f"task_{difficulty}")
             self._max_ticks = task_config.max_ticks if task_config else 20
 
             # Build initial observation
@@ -591,6 +595,7 @@ class FirewatchEnvironment(Environment):
                 episode_score = grade(
                     self._episode_result, self._difficulty,
                     task_id=self._task_id,
+                    services=self._mesh.services,
                 )
                 self._episode_done = True
 
@@ -615,6 +620,7 @@ class FirewatchEnvironment(Environment):
             next_obs.reward = round(reward, 6)
             next_obs.episode_score = episode_score   # None unless done=True
             next_obs.metadata = info
+            self._last_info = info
 
             # --- 13. Update prev_obs ---
             self._prev_obs = next_obs
@@ -627,6 +633,7 @@ class FirewatchEnvironment(Environment):
             error_obs.done = False
             error_obs.reward = 0.0
             error_obs.metadata = {"error": str(exc), "traceback": tb}
+            self._last_info = error_obs.metadata
             return error_obs
 
     # ------------------------------------------------------------------

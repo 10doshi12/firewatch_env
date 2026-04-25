@@ -45,7 +45,7 @@ class TestTaskRegistry:
         "task_hard_cache_corruption",
     ]
 
-    LEGACY_TASK_IDS = ["task_easy", "task_medium", "task_hard"]
+    REMOVED_LEGACY_TASK_IDS = ["task_easy", "task_medium", "task_hard"]
 
     PHASE2_EASY_TASK_IDS = [
         "task_easy_thundering_herd",
@@ -74,14 +74,14 @@ class TestTaskRegistry:
         for tid in self.PHASE1_TASK_IDS:
             assert tid in TASKS, f"Missing task: {tid}"
 
-    def test_legacy_tasks_preserved(self):
-        """Legacy tasks must still exist for backward compat."""
-        for tid in self.LEGACY_TASK_IDS:
-            assert tid in TASKS, f"Legacy task missing: {tid}"
+    def test_legacy_tasks_removed(self):
+        """Legacy scaffold tasks are not part of the active benchmark set."""
+        for tid in self.REMOVED_LEGACY_TASK_IDS:
+            assert tid not in TASKS, f"Legacy task still registered: {tid}"
 
     def test_total_task_count(self):
-        """3 legacy + 15 Phase 1 + 16 Phase 2 + 8 SPEC-08 Hard + 19 SPEC-11 P3 + 2 SPEC-12 P3 Hard = 63 total tasks."""
-        assert len(TASKS) == 63, f"Expected 63 tasks, got {len(TASKS)}"
+        """15 Phase 1 + 16 Phase 2 + 8 SPEC-08 Hard + 19 SPEC-11 P3 + 2 SPEC-12 P3 Hard = 60 total tasks."""
+        assert len(TASKS) == 60, f"Expected 60 tasks, got {len(TASKS)}"
 
     @pytest.mark.parametrize("task_id", PHASE1_TASK_IDS)
     def test_budget_identity(self, task_id):
@@ -653,7 +653,7 @@ class TestSeedLookup:
 
     def test_seed_lookup_finds_correct_task(self):
         """Calling generate_episode with matching (difficulty, seed) finds the task."""
-        mesh, fc = generate_episode("easy", 84)  # E-R2 seed
+        mesh, fc = generate_episode("easy", 315)  # E-R2 grader seed
         assert fc.root_cause_service == "notification-service"
         assert fc.fault_type == "bad_deploy"
 

@@ -95,13 +95,12 @@ class StepInfoMiddleware(BaseHTTPMiddleware):
                 data = json.loads(body_bytes)
 
                 obs = data.get("observation", {})
-                # Build info from observation fields that belong in metadata
-                info: dict = {}
+                # openenv-core drops Observation.metadata during serialization.
+                # The singleton environment keeps the rich info from the last
+                # step so HTTP clients can consume the same diagnostics.
+                info = dict(getattr(_SINGLETON_ENV, "_last_info", {}) or {})
                 if "episode_score" in obs and obs["episode_score"] is not None:
                     info["episode_score"] = float(obs["episode_score"])
-                # Propagate any error info
-                if "error" in obs:
-                    info["error"] = obs["error"]
 
                 data["info"] = info
 

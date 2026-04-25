@@ -1293,7 +1293,7 @@ def grade(
     if task_id:
         task = TASKS.get(task_id)
     if task is None:
-        task = TASKS.get(f"task_{difficulty}")
+        task = next((t for t in TASKS.values() if t.difficulty == difficulty), None)
     if task is None:
         return 0.0
 

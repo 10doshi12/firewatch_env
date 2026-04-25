@@ -203,9 +203,9 @@ All tasks are seeded deterministically for reproducibility. Red herring services
 
 | Task ID | Difficulty | Services | Red Herrings | Max Ticks | SLO Burn/Tick | Seed |
 |---|---|---|---|---|---|---|
-| `task_easy` | Easy | 3 | 0 | 20 | 1.5% | 42 |
-| `task_medium` | Medium | 5 | 1 | 30 | 2.5% | 137 |
-| `task_hard` | Hard | 7 | 3 (1 adversarial) | 40 | 3.0% | 256 |
+| `task_easy_oom_baseline` | Easy | 3 | 0 | 20 | 1.5% | 42 |
+| `task_medium_cascade_memleak` | Medium | 5 | 1 | 30 | 2.0% | 295 |
+| `task_hard_config_drift_noise` | Hard | 8 | 3 | 40 | 3.0% | 2560 |
 
 ### Task 1 — Easy: Single Service OOM
 
@@ -445,9 +445,9 @@ Scores produced by running `inference.py` against two models across two determin
 
 | | **Grok 4.1 Fast (Run 1)** | **Grok 4.1 Fast (Run 2)** | **DeepSeek V3.2 (Run 1)** | **DeepSeek V3.2 (Run 2)** |
 |---|:---:|:---:|:---:|:---:|
-| **task_easy** (OOM) | **0.96** · 4 steps | **0.96** · 4 steps | 0.91 · 5 steps | 0.91 · 5 steps |
-| **task_medium** (Cascade) | **0.95** · 4 steps | **0.95** · 4 steps | 0.81 · 6 steps | 0.81 · 6 steps |
-| **task_hard** (Adversarial) | **0.94** · 8 steps | 0.89 · 10 steps | 0.81 · 20 steps | **0.83** · 17 steps |
+| **task_easy_oom_baseline** (OOM) | Historical baseline row replaced by active task set | - | - | - |
+| **task_medium_cascade_memleak** (Memory leak) | Historical baseline row replaced by active task set | - | - | - |
+| **task_hard_config_drift_noise** (Config drift) | Historical baseline row replaced by active task set | - | - | - |
 | **Avg Score** | **0.95** | 0.93 | 0.84 | 0.85 |
 | **Total Steps** | **16** | 18 | 31 | 28 |
 | **Wrong Actions** | 0 | 1 | 2 | 2 |

@@ -128,14 +128,14 @@ This runs your agent across all three tasks sequentially:
 
 | Task | Difficulty | Services | Red Herrings | Max Ticks | Seed |
 |------|-----------|----------|-------------|-----------|------|
-| `task_easy` | Easy | 3 | 0 | 20 | 42 |
-| `task_medium` | Medium | 5 | 1 | 30 | 137 |
-| `task_hard` | Hard | 7 | 3 (1 adversarial) | 40 | 256 |
+| `task_easy_oom_baseline` | Easy | 3 | 0 | 20 | 42 |
+| `task_medium_cascade_memleak` | Medium | 5 | 1 | 30 | 295 |
+| `task_hard_config_drift_noise` | Hard | 8 | 3 | 40 | 2560 |
 
 ### Expected Output
 
 ```
-[START] task=task_easy env=firewatch-env model=x-ai/grok-4.1-fast
+[START] task=task_easy_oom_baseline env=firewatch-env model=x-ai/grok-4.1-fast
 [STEP] step=1 action=fetch_logs:cache reward=-0.14 done=false error=null
 [STEP] step=2 action=rollback_deploy:cache reward=-0.14 done=false error=null
 ...
