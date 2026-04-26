@@ -22,6 +22,8 @@ date: 2026-04-26
 
 # FirewatchEnv: An OpenEnv-Compliant SRE Incident Response Environment That Runs Without Kubernetes
 
+**[Interactive demo — incident lab (Vercel)](https://firewatch-demo-fawn.vercel.app/)** — visual walkthrough of checkout latency / bad-deploy narrative for judges; mock telemetry UI only (does not call the Hugging Face Space or Python simulator).
+
 > *The first portable RL training environment for autonomous on-call agents — physics-based simulation, OpenTelemetry-aligned telemetry, adversarial prompt-injection tasks, and a four-component grader that cannot be gamed.*
 
 ---
@@ -42,6 +44,7 @@ If you only have a few minutes, verify these claims — each maps to something y
 
 | Claim | How to verify |
 |--------|----------------|
+| **60-second story (mock UI)** | Open **[Firewatch Demo on Vercel](https://firewatch-demo-fawn.vercel.app/)** — visual incident flow only; does not call the Python Space. |
 | **OpenEnv-native** | Space exposes `POST /reset`, `POST /step`, `GET /state`, `GET /health` with JSON bodies matching the OpenEnv step-reset pattern. |
 | **Deterministic physics** | Same `(difficulty, seed, task_id)` → same episode trajectory (no global `random.seed()` in the engine). |
 | **Honest evaluation** | Legacy env `inference.py` leakage vectors were removed; production agent uses `runners/honest_prompt.py` with **pinned CI tests** that fail on reward text, oracle hints, fault-typed menus, and trivial success thresholds. |

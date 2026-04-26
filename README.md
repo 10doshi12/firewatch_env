@@ -16,6 +16,8 @@ base_path: /web
 
 # FirewatchEnv
 
+**[Interactive demo (visual incident walkthrough)](https://firewatch-demo-fawn.vercel.app/)** — browser mock of the trained-agent story (static Next.js; does not call the Python Space).
+
 **OpenEnv Hackathon India 2026 submission.** FirewatchEnv is a Kubernetes-free RL environment for training LLM agents to handle production incidents like an on-call SRE.
 
 The agent sees live microservice telemetry, chooses investigation/remediation actions, and is rewarded for restoring user-facing health before the SLO budget burns down. It runs as a single Docker Space, so judges can pull and evaluate it directly from Hugging Face.
@@ -27,6 +29,7 @@ The agent sees live microservice telemetry, chooses investigation/remediation ac
 
 | Material | Link |
 |---|---|
+| Interactive demo | [firewatch-demo-fawn.vercel.app](https://firewatch-demo-fawn.vercel.app/) |
 | Runnable environment | [`10doshi12/firewatch-env`](https://huggingface.co/spaces/10doshi12/firewatch-env) |
 | Agent, training, eval code | [`firewatch_agent`](https://github.com/10doshi12/firewatch_agent) |
 | SFT dataset | [`10doshi12/firewatch-sft-data`](https://huggingface.co/datasets/10doshi12/firewatch-sft-data) |
